@@ -7,7 +7,7 @@ description: >
   WebSocket and relays messages between Sabha rooms (or DMs) and the
   Hermes agent. Bearer-auth REST for outbound, /cable WebSocket for
   inbound.
-author: ashwinmk
+author: sabha-co
 requires_env:
   - SABHA_BASE_URL
   - SABHA_BOT_KEY

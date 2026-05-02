@@ -9,7 +9,7 @@ description = "Sabha platform adapter (out-of-tree plugin) for Hermes Agent."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "ashwinmk", email = "ashwinmk2016@gmail.com" }]
+authors = [{ name = "Sabha", email = "ashwinmk2016@gmail.com" }]
 keywords = ["hermes", "sabha", "chat", "bot", "plugin"]
 dependencies = [
   "aiohttp>=3.9",
@@ -22,5 +22,8 @@ dev = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/sabha-co/hermes-sabha"
+Repository = "https://github.com/sabha-co/hermes-sabha"
+Issues = "https://github.com/sabha-co/hermes-sabha/issues"
 Hermes = "https://github.com/NousResearch/hermes-agent"
 Sabha = "https://sabha.co"

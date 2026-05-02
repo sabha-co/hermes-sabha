@@ -7,9 +7,18 @@ Drop-in plugin — clone into `~/.hermes/plugins/`, point it at a Sabha bot key,
 ## Install
 
 ```bash
-git clone https://github.com/ashwinmk/hermes-sabha ~/.hermes/plugins/sabha
-hermes plugins enable sabha    # user-installed plugins are opt-in
-hermes gateway setup           # walks you through Sabha credentials
+hermes plugins install sabha-co/hermes-sabha
+hermes plugins enable sabha-platform   # user-installed plugins are opt-in
+hermes gateway setup                   # walks you through Sabha credentials
+hermes gateway restart
+```
+
+Or clone manually if you'd rather pin to a specific commit:
+
+```bash
+git clone https://github.com/sabha-co/hermes-sabha ~/.hermes/plugins/sabha
+hermes plugins enable sabha-platform
+hermes gateway setup
 hermes gateway restart
 ```
 
