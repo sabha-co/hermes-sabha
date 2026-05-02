@@ -1,0 +1,13 @@
+name: sabha-platform
+kind: platform
+version: 0.1.0
+description: >
+  Sabha gateway adapter for Hermes Agent.
+  Connects to a Sabha workspace (https://sabha.co) via REST + ActionCable
+  WebSocket and relays messages between Sabha rooms (or DMs) and the
+  Hermes agent. Bearer-auth REST for outbound, /cable WebSocket for
+  inbound.
+author: ashwinmk
+requires_env:
+  - SABHA_BASE_URL
+  - SABHA_BOT_KEY
