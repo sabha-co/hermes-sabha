@@ -152,8 +152,17 @@ class SabhaClient:
         file_path: str,
         *,
         filename: Optional[str] = None,
+        parent_message_id: Optional[int | str] = None,
     ) -> Optional[dict[str, int]]:
-        """Multipart upload to ``POST /rooms/:id/messages``."""
+        """Multipart upload to ``POST /rooms/:id/messages``.
+
+        When ``parent_message_id`` is set the server routes the upload into
+        that message's thread room (same idempotent thread resolution as
+        ``send_message``); the response ``room_id`` is the resolved thread.
+        """
+        path = f"/rooms/{room_id}/messages"
+        if parent_message_id is not None:
+            path = f"{path}?parent_message_id={parent_message_id}"
         with open(file_path, "rb") as fh:
             data = aiohttp.FormData()
             data.add_field(
@@ -163,7 +172,7 @@ class SabhaClient:
             )
             resp = await self._request(
                 "POST",
-                f"/rooms/{room_id}/messages",
+                path,
                 headers=self._headers(),
                 data=data,
             )

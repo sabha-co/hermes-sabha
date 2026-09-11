@@ -79,7 +79,7 @@ To mention users from agent output, use the literal `@{user_id}` token (numeric 
 - **Streaming replies** via in-place edits — the bot's message updates as the agent generates, instead of arriving all at once.
 - **Threading** — replying to a message inside a non-DM room continues in a thread automatically.
 - **Inbound attachments** — images, audio and documents are downloaded and made available to the agent's vision/audio tools.
-- **Outbound attachments** — `send_image`, `send_document`.
+- **Outbound attachments** — images, documents, audio and video from local files are uploaded natively (`send_image_file`, `send_document`, `send_voice`, `send_video`). Captions are delivered as a follow-up message in the same room/thread, since Sabha uploads carry no caption field. `send_image` with a remote URL falls back to posting the link as text.
 - **Edit / delete / react** on prior bot messages.
 - **Allowlist** integration with Hermes' standard `*_ALLOWED_USERS` mechanism.
 

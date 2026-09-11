@@ -32,10 +32,12 @@ import aiohttp
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
 )
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
 
 from .client import SabhaApiError, SabhaClient
@@ -65,6 +67,20 @@ def _api_base_url(base_url: str, override: str = "") -> str:
     if override:
         return override.rstrip("/")
     return base_url.rstrip("/") + "/api/bots"
+
+
+def _ext_from(filename: str, content_type: str, default: str) -> str:
+    """Best-effort file extension (leading dot) for the image/audio cache
+    helpers — they name the cached file by *extension*, not by the original
+    filename, so a filename must not be passed through as-is."""
+    import mimetypes
+    import os
+
+    _, ext = os.path.splitext(filename or "")
+    if ext:
+        return ext
+    guessed = mimetypes.guess_extension((content_type or "").split(";")[0].strip())
+    return guessed or default
 
 
 class SabhaAdapter(BasePlatformAdapter):
@@ -103,7 +119,7 @@ class SabhaAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._base_url or not self._bot_key:
             self._set_fatal_error(
                 "config_missing",
@@ -247,6 +263,94 @@ class SabhaAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    # ── Outbound attachments ──────────────────────────────────────────────
+
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str],
+        reply_to: Optional[str],
+        filename: Optional[str] = None,
+    ) -> SendResult:
+        """Upload a local file to a room (or thread) via multipart. Sabha
+        uploads carry no caption field, so a caption is delivered as a
+        follow-up message in the same location as the attachment."""
+        if self._client is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+        try:
+            result = await self._client.send_attachment(
+                chat_id,
+                file_path,
+                filename=filename,
+                parent_message_id=reply_to,
+            )
+        except FileNotFoundError as e:
+            return SendResult(success=False, error=str(e), retryable=False)
+        except SabhaApiError as e:
+            return SendResult(success=False, error=str(e), retryable=e.status >= 500)
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+
+        if result is None:
+            return SendResult(
+                success=False,
+                error="Sabha returned an empty/malformed upload response",
+                retryable=True,
+            )
+        if caption and caption.strip():
+            # Reuse the attachment's reply_to so the caption lands alongside it
+            # (same top-level room, or same thread) rather than under the file.
+            await self.send(chat_id, caption, reply_to=reply_to)
+        return SendResult(success=True, message_id=str(result["id"]))
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(
+            chat_id, file_path, caption, reply_to, filename=file_name
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, image_path, caption, reply_to)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, audio_path, caption, reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, video_path, caption, reply_to)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Typing indicators ride on AnyCable whispers — see typing.py for the
         # follow-up implementation. No-op for now so the base class's
@@ -340,13 +444,14 @@ class SabhaAdapter(BasePlatformAdapter):
                     msg_type = kind
                     break
             if msg_type == MessageType.PHOTO:
-                from gateway.platforms.base import cache_image_from_bytes
-                cache_path = cache_image_from_bytes(data, filename)
+                cache_path = cache_image_from_bytes(
+                    data, _ext_from(filename, content_type, ".jpg")
+                )
             elif msg_type == MessageType.AUDIO:
-                from gateway.platforms.base import cache_audio_from_bytes
-                cache_path = cache_audio_from_bytes(data, filename)
+                cache_path = cache_audio_from_bytes(
+                    data, _ext_from(filename, content_type, ".ogg")
+                )
             else:
-                from gateway.platforms.base import cache_document_from_bytes
                 cache_path = cache_document_from_bytes(data, filename)
         except Exception as e:
             logger.warning("Sabha: attachment cache failed: %s", e)
@@ -363,13 +468,19 @@ class SabhaAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    """True when the env vars Sabha needs are present.
+    """Passive dependency probe — are this plugin's Python deps importable
+    right now?
 
-    aiohttp and the Python ``websockets`` lib (via aiohttp's WS client) are
-    transitive deps of Hermes' built-in adapters, so there is no extra
-    install step.
+    ``register_platform`` treats ``check_fn`` as a side-effect-free "deps
+    present?" check (status displays call it freely, so it must never install
+    or touch config). Whether Sabha is *configured* is answered separately by
+    ``validate_config``. aiohttp is the only third-party dependency.
     """
-    return bool(os.getenv("SABHA_BASE_URL") and os.getenv("SABHA_BOT_KEY"))
+    try:
+        import aiohttp  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def validate_config(config: Any) -> bool:
@@ -381,6 +492,72 @@ def validate_config(config: Any) -> bool:
 
 def is_connected(config: Any) -> bool:
     return validate_config(config)
+
+
+def env_enablement() -> Optional[dict[str, Any]]:
+    """Seed ``PlatformConfig.extra`` from env vars BEFORE the adapter is
+    constructed, so env-only setups surface in ``hermes gateway status`` and
+    ``get_connected_platforms()`` without waiting for the SDK to instantiate.
+    Returns ``None`` when Sabha isn't minimally configured (the caller then
+    skips auto-enabling it)."""
+    base_url = (os.getenv("SABHA_BASE_URL") or "").strip()
+    bot_key = (os.getenv("SABHA_BOT_KEY") or "").strip()
+    if not (base_url and bot_key):
+        return None
+    seed: dict[str, Any] = {"base_url": base_url, "bot_key": bot_key}
+    for env_key, cfg_key in (
+        ("SABHA_API_BASE_URL", "api_base_url"),
+        ("SABHA_WEBSOCKET_URL", "websocket_url"),
+        ("SABHA_BOT_ID", "bot_id"),
+    ):
+        if value := (os.getenv(env_key) or "").strip():
+            seed[cfg_key] = value
+    # Home room for cron ``deliver=sabha`` and gateway notifications.
+    if home := (os.getenv("SABHA_HOME_CHANNEL") or "").strip():
+        seed["home_channel"] = {
+            "chat_id": home,
+            "name": os.getenv("SABHA_HOME_CHANNEL_NAME", home),
+        }
+    return seed
+
+
+async def standalone_send(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[list[str]] = None,
+    force_document: bool = False,
+) -> dict[str, Any]:
+    """Out-of-process delivery for cron jobs (``deliver=sabha``) and the
+    ``send_message`` tool when they run separately from the gateway. Opens a
+    short-lived REST client, sends one message, and closes it.
+
+    ``thread_id`` routes into a thread (Sabha ``parent_message_id``).
+    ``media_files``/``force_document`` are accepted for signature parity with
+    the platform contract; attachment delivery is handled by the live adapter.
+    """
+    extra = _coerce_extra(pconfig)
+    base_url = _config_value(extra, "SABHA_BASE_URL", "base_url")
+    bot_key = _config_value(extra, "SABHA_BOT_KEY", "bot_key")
+    if not base_url or not bot_key:
+        return {"error": "SABHA_BASE_URL and SABHA_BOT_KEY must be configured"}
+    api_base_url = _api_base_url(
+        base_url, _config_value(extra, "SABHA_API_BASE_URL", "api_base_url")
+    )
+    client = SabhaClient(api_base_url, bot_key)
+    try:
+        result = await client.send_message(
+            chat_id, message, parent_message_id=thread_id
+        )
+    except Exception as e:
+        return {"error": f"Sabha standalone send failed: {e}"}
+    finally:
+        await client.close()
+    if result is None:
+        return {"error": "Sabha returned an empty/malformed send response"}
+    return {"success": True, "message_id": str(result["id"])}
 
 
 def interactive_setup() -> None:
@@ -464,6 +641,9 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         setup_fn=interactive_setup,
+        env_enablement_fn=env_enablement,  # env-only setups show in gateway status
+        cron_deliver_env_var="SABHA_HOME_CHANNEL",  # cron deliver=sabha target
+        standalone_sender_fn=standalone_send,  # cron/send_message outside the gateway
         required_env=["SABHA_BASE_URL", "SABHA_BOT_KEY"],
         install_hint="pip install aiohttp",
         allowed_users_env="SABHA_ALLOWED_USERS",
