@@ -34,6 +34,7 @@ from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 
 from . import markup
 from . import routing
+from .retries import RetryIds
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class SabhaAdapter(BasePlatformAdapter):
         self._app_name = ""
         self._working: dict[str, str] = {}  # message id → id of the 👀 reaction on it
         self._dedup = MessageDeduplicator(ttl_seconds=600)
+        self._retry_ids = RetryIds()
 
     # --- Lifecycle ---
 
@@ -207,23 +209,30 @@ class SabhaAdapter(BasePlatformAdapter):
                    metadata: _Metadata = None) -> SendResult:
         if not content or not content.strip():
             return SendResult(success=True)
+        thread_id = _thread_of(metadata)
+        chunks = self.truncate_message(content, MAX_MESSAGE_LENGTH)
+        send = (chat_id, thread_id, content)
+        ids = self._retry_ids.take(send, len(chunks))
         result = SendResult(success=True)
-        for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
-            result = await self._post(chat_id, markup.to_html(chunk), _thread_of(metadata))
+        for chunk, client_message_id in zip(chunks, ids):
+            result = await self._post(chat_id, markup.to_html(chunk), thread_id, client_message_id)
             if not result.success:
+                # Chunks already posted answer a retry with themselves, so it posts only the rest.
+                self._retry_ids.hold(send, ids)
                 break
         return result
 
-    async def _post(self, chat_id: str, html: str, thread_id: Optional[str]) -> SendResult:
+    async def _post(self, chat_id: str, html: str, thread_id: Optional[str], client_message_id: str) -> SendResult:
         from .api import SabhaApiError
         try:
-            posted = await self._api.post_message(chat_id, html, parent_message_id=thread_id)
+            posted = await self._api.post_message(chat_id, html, parent_message_id=thread_id,
+                                                  client_message_id=client_message_id)
         except SabhaApiError as exc:
             if not (thread_id and exc.status in _THREAD_REFUSALS):
                 return _failed(exc)
             logger.warning("Sabha: couldn't reply in the thread of %s (%s); posting in the room", thread_id, exc)
             try:
-                posted = await self._api.post_message(chat_id, html)
+                posted = await self._api.post_message(chat_id, html, client_message_id=client_message_id)
             except SabhaApiError as retry_exc:
                 return _failed(retry_exc)
         except Exception as exc:
@@ -280,7 +289,6 @@ class SabhaAdapter(BasePlatformAdapter):
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], metadata: _Metadata,
                          file_name: Optional[str] = None) -> SendResult:
         """A Sabha message holds a body or a file, not both, so a caption goes first on its own."""
-        from .api import SabhaApiError
         if not Path(path).is_file():
             return SendResult(success=False, error=f"File not found: {path}")
         if caption:
@@ -288,17 +296,29 @@ class SabhaAdapter(BasePlatformAdapter):
             if not sent.success:
                 return sent
         thread_id = _thread_of(metadata)
+        send = (chat_id, thread_id, "file", path, file_name)
+        [client_message_id] = self._retry_ids.take(send, 1)
+        result = await self._post_file(chat_id, path, file_name, thread_id, client_message_id)
+        if not result.success:
+            self._retry_ids.hold(send, [client_message_id])
+        return result
+
+    async def _post_file(self, chat_id: str, path: str, file_name: Optional[str], thread_id: Optional[str],
+                         client_message_id: str) -> SendResult:
+        from .api import SabhaApiError
         try:
-            posted = await self._api.post_file(chat_id, path, filename=file_name, parent_message_id=thread_id)
+            posted = await self._api.post_file(chat_id, path, filename=file_name, parent_message_id=thread_id,
+                                               client_message_id=client_message_id)
         except SabhaApiError as exc:
             if not (thread_id and exc.status in _THREAD_REFUSALS):
                 return _failed(exc)
             try:
-                posted = await self._api.post_file(chat_id, path, filename=file_name)
+                posted = await self._api.post_file(chat_id, path, filename=file_name,
+                                                   client_message_id=client_message_id)
             except SabhaApiError as retry_exc:
                 return _failed(retry_exc)
         except Exception as exc:
-            return SendResult(success=False, error=f"Sabha upload failed: {exc}")
+            return SendResult(success=False, error=f"Sabha upload failed: {exc}", retryable=True)
         return SendResult(success=True, message_id=posted.id)
 
     # --- Working reaction ---

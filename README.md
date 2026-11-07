@@ -68,6 +68,10 @@ platforms:
   as attachments, with any caption as a message just before.
 - **Commands.** A message starting with `/` that Sabha doesn't claim reaches Hermes as a command
   (`/new`, `/stop`…).
+- **Retries.** Every post carries an id of its own. When a post times out or fails with a 5xx,
+  Hermes retries it, and Sabha answers a post it already saved with that message instead of
+  posting it twice. On a Sabha too old to take the id, the plugin posts without it, and a
+  retried post can then land twice.
 - **Cron.** `deliver=sabha` posts to `SABHA_HOME_CHANNEL`, from the gateway or from a separate
   `hermes cron` process.
 
@@ -84,9 +88,9 @@ replayed.
 ## Development
 
 ```bash
-uv run --no-project --with pytest --with markdown-it-py python -m pytest
+uv run --no-project --with pytest --with markdown-it-py --with aiohttp python -m pytest
 ```
 
-The tests cover routing and formatting, which don't need Hermes installed. The adapter itself is
-checked against a running Hermes gateway and Sabha. The full API reference is `GET /skill` on any
+The tests cover routing, formatting, retries and the API client, which don't need Hermes
+installed. The adapter itself is checked against a running Hermes gateway and Sabha. The full API reference is `GET /skill` on any
 Sabha workspace.

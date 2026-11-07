@@ -6,7 +6,7 @@ import logging
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 
@@ -30,6 +30,7 @@ class SabhaApi:
         self._session = session
         self._base = api_url.rstrip("/")
         self._auth = {"Authorization": f"Bearer {key}"}
+        self._takes_client_message_id = True
 
     async def me(self) -> dict[str, Any]:
         return await self._request("GET", "/me")
@@ -37,20 +38,25 @@ class SabhaApi:
     async def room(self, room_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/rooms/{room_id}")
 
-    async def post_message(self, room_id: str, html: str, *, parent_message_id: Optional[str] = None) -> Posted:
-        data = await self._request("POST", f"/rooms/{room_id}/messages", json={"body": html},
-                                   params=_thread_params(parent_message_id))
-        return Posted(str(data["id"]), str(data["room_id"]))
+    async def post_message(self, room_id: str, html: str, *, parent_message_id: Optional[str] = None,
+                           client_message_id: Optional[str] = None) -> Posted:
+        return await self._create(room_id, parent_message_id, client_message_id,
+                                  lambda extra: {"json": {"body": html, **extra}})
 
     async def post_file(self, room_id: str, path: str, *, filename: Optional[str] = None,
-                        parent_message_id: Optional[str] = None) -> Posted:
+                        parent_message_id: Optional[str] = None, client_message_id: Optional[str] = None) -> Posted:
         name = filename or Path(path).name
-        form = aiohttp.FormData()
-        form.add_field("attachment", Path(path).read_bytes(), filename=name,
-                       content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
-        data = await self._request("POST", f"/rooms/{room_id}/messages", data=form,
-                                   params=_thread_params(parent_message_id), timeout=120)
-        return Posted(str(data["id"]), str(data["room_id"]))
+        content = Path(path).read_bytes()
+
+        def request(extra: dict[str, str]) -> dict[str, Any]:
+            form = aiohttp.FormData()
+            form.add_field("attachment", content, filename=name,
+                           content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
+            for field, value in extra.items():
+                form.add_field(field, value)
+            return {"data": form, "timeout": 120}
+
+        return await self._create(room_id, parent_message_id, client_message_id, request)
 
     async def edit_message(self, message_id: str, html: str) -> None:
         await self._request("PATCH", f"/messages/{message_id}", json={"body": html})
@@ -70,6 +76,23 @@ class SabhaApi:
         async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
             resp.raise_for_status()
             return await resp.read()
+
+    async def _create(self, room_id: str, parent_message_id: Optional[str], client_message_id: Optional[str],
+                      request: Callable[[dict[str, str]], dict[str, Any]]) -> Posted:
+        """Post a message. With a client_message_id, a retry after a lost response gets back the post
+        Sabha already saved instead of a second one. A server older than that refuses the key; the
+        post then goes without it, and so does every later one."""
+        path, params = f"/rooms/{room_id}/messages", _thread_params(parent_message_id)
+        extra = {"client_message_id": client_message_id} if client_message_id and self._takes_client_message_id else {}
+        try:
+            data = await self._request("POST", path, params=params, **request(extra))
+        except SabhaApiError as exc:
+            if not (extra and exc.status == 422 and "client_message_id is not permitted" in str(exc)):
+                raise
+            logger.info("Sabha: this server doesn't take client_message_id, so retried posts may land twice")
+            self._takes_client_message_id = False
+            data = await self._request("POST", path, params=params, **request({}))
+        return Posted(str(data["id"]), str(data["room_id"]))
 
     async def _request(self, method: str, path: str, *, json: Any = None, text: Optional[str] = None,
                        data: Any = None, params: Optional[dict] = None, timeout: float = 30) -> dict[str, Any]:
