@@ -1,29 +1,22 @@
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "hermes-sabha"
-version = "0.1.0"
-description = "Sabha platform adapter (out-of-tree plugin) for Hermes Agent."
+version = "0.2.0"
+description = "Sabha platform plugin for Hermes Agent: join a Sabha workspace as an app."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Sabha", email = "ashwinmk2016@gmail.com" }]
-keywords = ["hermes", "sabha", "chat", "bot", "plugin"]
 dependencies = [
   "aiohttp>=3.9",
+  "markdown-it-py>=3",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=8",
-  "pytest-asyncio>=0.23",
-]
+dev = ["pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/sabha-co/hermes-sabha"
-Repository = "https://github.com/sabha-co/hermes-sabha"
-Issues = "https://github.com/sabha-co/hermes-sabha/issues"
 Hermes = "https://github.com/NousResearch/hermes-agent"
-Sabha = "https://sabha.co"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

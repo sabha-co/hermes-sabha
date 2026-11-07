@@ -1,47 +1,47 @@
 name: sabha-platform
 label: Sabha
 kind: platform
-version: 0.1.0
+version: "0.2.0"
 description: >
-  Sabha gateway adapter for Hermes Agent.
-  Connects to a Sabha workspace (https://sabha.co) via REST + ActionCable
-  WebSocket and relays messages between Sabha rooms (or DMs) and the
-  Hermes agent. Bearer-auth REST for outbound, /cable WebSocket for
-  inbound.
-author: sabha-co
-# ``requires_env`` / ``optional_env`` rich-dict entries auto-populate the
-# ``hermes gateway setup`` wizard (descriptions, prompts, password flags).
+  Sabha gateway adapter for Hermes Agent. Joins a Sabha workspace as an app:
+  hears mentions, DMs and threads over the app WebSocket (AppEventsChannel),
+  and replies through the apps API (/api/v1) with threads, streamed edits,
+  reactions and file attachments. Needs no public URL.
+author: Sabha
+license: MIT
+homepage: https://github.com/sabha-co/hermes-sabha
+tags: [messaging, chat, sabha]
 requires_env:
-  - name: SABHA_BASE_URL
-    description: "Workspace URL (e.g. https://sabha.co/1000006)"
-    prompt: "Sabha base URL"
-    password: false
-  - name: SABHA_BOT_KEY
-    description: "Bot key from Settings → Integrations → Bots (format: bot_id-token)"
-    prompt: "Bot key"
-    password: true
-optional_env:
-  - name: SABHA_API_BASE_URL
-    description: "Override the bot API base (defaults to {BASE_URL}/api/bots)"
-    prompt: "API base URL (optional)"
+  - name: SABHA_API_URL
+    description: "API base URL from the app's page in Sabha (Settings → Apps), e.g. https://chat.example.com/api/v1"
+    prompt: "Sabha API base URL"
     password: false
   - name: SABHA_WEBSOCKET_URL
-    description: "Override the ActionCable URL (defaults to wss://{host}/cable)"
-    prompt: "WebSocket URL (optional)"
+    description: "WebSocket URL from the app's page, e.g. wss://chat.example.com/cable"
+    prompt: "Sabha WebSocket URL"
     password: false
-  - name: SABHA_BOT_ID
-    description: "Numeric bot user id (optional; discovered via /me when unset)"
-    prompt: "Bot id (optional)"
-    password: false
+  - name: SABHA_APP_KEY
+    description: "The app's bearer key (sabha_app_…), shown once on the app's page"
+    prompt: "Sabha app key"
+    password: true
+optional_env:
   - name: SABHA_ALLOWED_USERS
-    description: "Comma-separated Sabha user ids allowed to talk to the bot"
+    description: "Comma-separated Sabha user ids allowed to talk to the agent"
     prompt: "Allowed user ids (comma-separated)"
     password: false
   - name: SABHA_ALLOW_ALL_USERS
-    description: "Allow any visible user to talk to the bot (dev only)"
+    description: "Let anyone in the workspace talk to the agent (true/false)"
     prompt: "Allow all users? (true/false)"
     password: false
   - name: SABHA_HOME_CHANNEL
-    description: "Room id for cron / notification delivery (deliver=sabha target)"
-    prompt: "Home room id (optional)"
+    description: "Room id for cron and notification delivery"
+    prompt: "Home room id"
+    password: false
+  - name: SABHA_REPLY_MODE
+    description: "Reply to a room mention in a thread ('thread', the default) or in the room ('off')"
+    prompt: "Reply mode (thread|off)"
+    password: false
+  - name: SABHA_REACTIONS
+    description: "React 👀 to a message while working on it (default true)"
+    prompt: "Working reaction? (true/false)"
     password: false

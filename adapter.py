@@ -1,663 +1,459 @@
-"""
-Sabha platform adapter for Hermes Agent.
+"""Sabha gateway adapter for Hermes Agent.
 
-Out-of-tree plugin that wires Sabha (https://sabha.co) into a Hermes
-gateway via ``ctx.register_platform()``. Mirrors the IRC plugin's
-packaging idiom: single ``register(ctx)`` entry point, lazy imports
-from ``gateway.*``.
+Hermes joins a Sabha workspace as an app. Events come in over the app WebSocket
+(``AppEventsChannel``), and replies go out through the apps API (``/api/v1``). Sabha delivers a
+room message only when it mentions the app; a DM or a thread the app is in, every message.
 
-Configuration via environment variables (preferred):
-    SABHA_BASE_URL          # e.g. https://sabha.co/1000006
-    SABHA_API_BASE_URL      # optional override; defaults to {BASE_URL}/api/bots
-    SABHA_BOT_KEY           # bearer credential, format: "{bot_id}-{token}"
-    SABHA_WEBSOCKET_URL     # optional override; derived from BASE_URL
-    SABHA_BOT_ID            # optional override; otherwise discovered via /me
-    SABHA_ALLOWED_USERS     # comma-separated user ids
-    SABHA_ALLOW_ALL_USERS   # truthy to allow all senders
-
-Or under ``gateway.platforms.sabha.extra`` in config.yaml:
-    base_url, api_base_url, bot_key, websocket_url, bot_id,
-    typing_enabled, max_message_length
+Environment (or ``platforms.sabha.extra`` in config.yaml):
+    SABHA_API_URL        API base URL from the app's page, e.g. https://chat.example.com/api/v1
+    SABHA_WEBSOCKET_URL  WebSocket URL from the app's page, e.g. wss://chat.example.com/cable
+    SABHA_APP_KEY        The app's bearer key (sabha_app_…)
+    SABHA_ALLOWED_USERS  Comma-separated Sabha user ids allowed to talk to the agent
+    SABHA_HOME_CHANNEL   Room id for cron and notification delivery
+    SABHA_REPLY_MODE     "thread" (default) answers a room mention in a thread; "off" in the room
+    SABHA_REACTIONS      "true" (default) reacts 👀 while the agent works on a message
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
-import aiohttp
-
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms._shared import (
+    apply_yaml_bridge, env_is_connected, extra_or_secret, get_scoped_secret, seed_extra_from_env, send_error,
+)
 from gateway.platforms.base import (
-    BasePlatformAdapter,
-    SendResult,
-    cache_audio_from_bytes,
-    cache_document_from_bytes,
-    cache_image_from_bytes,
+    BasePlatformAdapter, SendResult, cache_audio_from_bytes_async, cache_document_from_bytes_async,
+    cache_image_from_bytes_async, cache_video_from_bytes_async, gateway_trust_env,
 )
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.config import Platform
+from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 
-from .client import SabhaApiError, SabhaClient
-from .monitor import SabhaMonitor, build_websocket_url
-from .webhook import resolve_chat_type, was_bot_mentioned
+from . import markup
+from . import routing
 
 logger = logging.getLogger(__name__)
 
+PLATFORM = "sabha"
+WORKING_REACTION = "👀"
 
-_DEFAULT_MAX_MESSAGE_LENGTH = 8000
-_ATTACHMENT_KIND_BY_PREFIX = {
-    "image/": MessageType.PHOTO,
-    "video/": MessageType.VIDEO,
-    "audio/": MessageType.AUDIO,
-}
+# Sabha has no hard cap this small; it keeps a streamed reply's edits cheap and a long answer readable.
+MAX_MESSAGE_LENGTH = 12000
 
-
-def _coerce_extra(config: Any) -> dict[str, Any]:
-    return dict(getattr(config, "extra", {}) or {})
-
-
-def _config_value(extra: dict[str, Any], env_key: str, cfg_key: str, default: str = "") -> str:
-    return os.getenv(env_key) or extra.get(cfg_key, default) or ""
+_Metadata = Optional[dict[str, Any]]
+_ENV = {"api_url": "SABHA_API_URL", "websocket_url": "SABHA_WEBSOCKET_URL", "key": "SABHA_APP_KEY"}
+# A parent that is gone (404) or can't hold a thread (422): post in the room instead.
+_THREAD_REFUSALS = {404, 422}
+_MEDIA_TYPES = (("image/", MessageType.PHOTO, cache_image_from_bytes_async, ".png"),
+                ("audio/", MessageType.VOICE, cache_audio_from_bytes_async, ".ogg"),
+                ("video/", MessageType.VIDEO, cache_video_from_bytes_async, ".mp4"))
 
 
-def _api_base_url(base_url: str, override: str = "") -> str:
-    if override:
-        return override.rstrip("/")
-    return base_url.rstrip("/") + "/api/bots"
+def _setting(config: Any, name: str, default: str = "") -> str:
+    return str(extra_or_secret(getattr(config, "extra", None) or {}, name, _ENV[name], default) or "").strip()
 
 
-def _ext_from(filename: str, content_type: str, default: str) -> str:
-    """Best-effort file extension (leading dot) for the image/audio cache
-    helpers — they name the cached file by *extension*, not by the original
-    filename, so a filename must not be passed through as-is."""
-    import mimetypes
-    import os
-
-    _, ext = os.path.splitext(filename or "")
-    if ext:
-        return ext
-    guessed = mimetypes.guess_extension((content_type or "").split(";")[0].strip())
-    return guessed or default
-
-
-class SabhaAdapter(BasePlatformAdapter):
-    """Adapter implementing BasePlatformAdapter for Sabha."""
-
-    def __init__(self, config: Any, **_kwargs: Any) -> None:
-        super().__init__(config=config, platform=Platform("sabha"))
-
-        extra = _coerce_extra(config)
-        self._base_url = _config_value(extra, "SABHA_BASE_URL", "base_url")
-        self._api_base_url = _api_base_url(
-            self._base_url,
-            _config_value(extra, "SABHA_API_BASE_URL", "api_base_url"),
-        )
-        self._bot_key = _config_value(extra, "SABHA_BOT_KEY", "bot_key")
-        self._websocket_url = _config_value(
-            extra, "SABHA_WEBSOCKET_URL", "websocket_url"
-        )
-
-        bot_id_raw = _config_value(extra, "SABHA_BOT_ID", "bot_id")
-        self._bot_user_id: Optional[int] = int(bot_id_raw) if bot_id_raw else None
-
-        self.max_message_length = int(
-            extra.get("max_message_length") or _DEFAULT_MAX_MESSAGE_LENGTH
-        )
-
-        self._http_session: Optional[aiohttp.ClientSession] = None
-        self._client: Optional[SabhaClient] = None
-        self._monitor: Optional[SabhaMonitor] = None
-        self._monitor_task: Optional[asyncio.Task[None]] = None
-        self._workspace_name: str = ""
-
-    @property
-    def name(self) -> str:
-        return "Sabha"
-
-    # ── Connection lifecycle ──────────────────────────────────────────────
-
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
-        if not self._base_url or not self._bot_key:
-            self._set_fatal_error(
-                "config_missing",
-                "SABHA_BASE_URL and SABHA_BOT_KEY must be set",
-                retryable=False,
-            )
-            return False
-
-        # Per-process lock keyed on (base_url, bot_key) — stops two profiles
-        # from racing the same identity over the same WS.
-        if not self._acquire_platform_lock(
-            "sabha",
-            f"{self._base_url}::{self._bot_key[:8]}",
-            f"Sabha bot at {self._base_url}",
-        ):
-            return False
-
-        self._http_session = aiohttp.ClientSession()
-        self._client = SabhaClient(
-            self._api_base_url, self._bot_key, session=self._http_session
-        )
-
-        try:
-            if self._bot_user_id is None:
-                me = await self._client.get_bot_self()
-                self._bot_user_id = int(me.get("id"))
-                self._workspace_name = me.get("workspace_name") or me.get("name", "")
-                logger.info(
-                    "Sabha: connected as bot id=%s name=%s",
-                    self._bot_user_id,
-                    me.get("name", ""),
-                )
-        except SabhaApiError as e:
-            await self._teardown()
-            retryable = e.status not in (401, 403)
-            self._set_fatal_error(
-                "auth_failed" if not retryable else "bootstrap_failed",
-                f"GET /me failed: {e}",
-                retryable=retryable,
-            )
-            return False
-        except Exception as e:
-            await self._teardown()
-            self._set_fatal_error("bootstrap_failed", str(e), retryable=True)
-            return False
-
-        ws_url = build_websocket_url(
-            self._base_url, self._bot_key, self._websocket_url or None
-        )
-        self._monitor = SabhaMonitor(
-            ws_url=ws_url,
-            bot_id=self._bot_user_id,
-            on_payload=self._dispatch_inbound,
-            session=self._http_session,
-            on_fatal=lambda code, msg: self._set_fatal_error(
-                code, msg, retryable=False
-            ),
-        )
-        self._monitor_task = self._monitor.start()
-        self._mark_connected()
-        return True
-
-    async def disconnect(self) -> None:
-        await self._teardown()
-        self._mark_disconnected()
-        self._release_platform_lock()
-
-    async def _teardown(self) -> None:
-        if self._monitor is not None:
-            await self._monitor.stop()
-            self._monitor = None
-            self._monitor_task = None
-        if self._client is not None:
-            try:
-                await self._client.close()
-            except Exception:
-                pass
-            self._client = None
-        if self._http_session is not None and not self._http_session.closed:
-            await self._http_session.close()
-        self._http_session = None
-
-    # ── Sending ───────────────────────────────────────────────────────────
-
-    async def send(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> SendResult:
-        if self._client is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-        try:
-            result = await self._client.send_message(
-                chat_id,
-                content,
-                parent_message_id=reply_to,
-            )
-        except SabhaApiError as e:
-            return SendResult(
-                success=False, error=str(e), retryable=e.status >= 500
-            )
-        except Exception as e:
-            return SendResult(success=False, error=str(e), retryable=True)
-
-        if result is None:
-            return SendResult(
-                success=False,
-                error="Sabha returned an empty/malformed send response",
-                retryable=True,
-            )
-        return SendResult(success=True, message_id=str(result["id"]))
-
-    async def edit_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        content: str,
-        *,
-        finalize: bool = False,
-    ) -> SendResult:
-        if self._client is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-        try:
-            await self._client.edit_message(message_id, content)
-        except SabhaApiError as e:
-            return SendResult(
-                success=False, error=str(e), retryable=e.status >= 500
-            )
-        except Exception as e:
-            return SendResult(success=False, error=str(e), retryable=True)
-        return SendResult(success=True, message_id=str(message_id))
-
-    async def delete_message(self, chat_id: str, message_id: str) -> bool:
-        if self._client is None:
-            return False
-        try:
-            await self._client.delete_message(message_id)
-            return True
-        except Exception:
-            return False
-
-    # ── Outbound attachments ──────────────────────────────────────────────
-
-    async def _send_local_file(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str],
-        reply_to: Optional[str],
-        filename: Optional[str] = None,
-    ) -> SendResult:
-        """Upload a local file to a room (or thread) via multipart. Sabha
-        uploads carry no caption field, so a caption is delivered as a
-        follow-up message in the same location as the attachment."""
-        if self._client is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-        try:
-            result = await self._client.send_attachment(
-                chat_id,
-                file_path,
-                filename=filename,
-                parent_message_id=reply_to,
-            )
-        except FileNotFoundError as e:
-            return SendResult(success=False, error=str(e), retryable=False)
-        except SabhaApiError as e:
-            return SendResult(success=False, error=str(e), retryable=e.status >= 500)
-        except Exception as e:
-            return SendResult(success=False, error=str(e), retryable=True)
-
-        if result is None:
-            return SendResult(
-                success=False,
-                error="Sabha returned an empty/malformed upload response",
-                retryable=True,
-            )
-        if caption and caption.strip():
-            # Reuse the attachment's reply_to so the caption lands alongside it
-            # (same top-level room, or same thread) rather than under the file.
-            await self.send(chat_id, caption, reply_to=reply_to)
-        return SendResult(success=True, message_id=str(result["id"]))
-
-    async def send_document(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str] = None,
-        file_name: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
-        **_kwargs: Any,
-    ) -> SendResult:
-        return await self._send_local_file(
-            chat_id, file_path, caption, reply_to, filename=file_name
-        )
-
-    async def send_image_file(
-        self,
-        chat_id: str,
-        image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
-        **_kwargs: Any,
-    ) -> SendResult:
-        return await self._send_local_file(chat_id, image_path, caption, reply_to)
-
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
-        **_kwargs: Any,
-    ) -> SendResult:
-        return await self._send_local_file(chat_id, audio_path, caption, reply_to)
-
-    async def send_video(
-        self,
-        chat_id: str,
-        video_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
-        **_kwargs: Any,
-    ) -> SendResult:
-        return await self._send_local_file(chat_id, video_path, caption, reply_to)
-
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        # Typing indicators ride on AnyCable whispers — see typing.py for the
-        # follow-up implementation. No-op for now so the base class's
-        # periodic-typing pump doesn't error.
-        return None
-
-    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
-        return {"name": chat_id, "type": "group", "chat_id": chat_id}
-
-    # ── Inbound dispatch ──────────────────────────────────────────────────
-
-    async def _dispatch_inbound(self, payload: dict[str, Any]) -> None:
-        if payload.get("event") != "message_created":
-            return
-        if self._bot_user_id is None:
-            return
-
-        room = payload.get("room") or {}
-        message = payload.get("message") or {}
-        user = payload.get("user") or {}
-
-        room_type = str(room.get("type") or "")
-        chat_type = resolve_chat_type(room_type)
-
-        # Group filter: in non-DMs, only react when @-mentioned.
-        if chat_type != "dm" and not was_bot_mentioned(payload, self._bot_user_id):
-            return
-
-        text = ((message.get("body") or {}).get("plain")) or ""
-        chat_id = str(room.get("id") or "")
-        chat_name = room.get("name") or chat_id
-        user_id = str(user.get("id") or "")
-        user_name = user.get("name") or user_id
-
-        media_urls: list[str] = []
-        media_types: list[str] = []
-        msg_type = MessageType.TEXT
-        attachment = message.get("attachment")
-        if isinstance(attachment, dict) and attachment.get("url"):
-            media_urls, media_types, msg_type = await self._cache_attachment(
-                attachment
-            )
-
-        thread = message.get("thread") or {}
-        reply_to = (
-            str(thread.get("parent_message_id"))
-            if isinstance(thread, dict) and thread.get("parent_message_id")
-            else None
-        )
-
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=chat_name,
-            chat_type=chat_type,
-            user_id=user_id,
-            user_name=user_name,
-        )
-        event = MessageEvent(
-            text=text,
-            message_type=msg_type,
-            source=source,
-            message_id=str(message.get("id")),
-            timestamp=datetime.now(),
-            media_urls=media_urls,
-            media_types=media_types,
-            reply_to_message_id=reply_to,
-            raw_message=payload,
-        )
-        await self.handle_message(event)
-
-    async def _cache_attachment(
-        self, attachment: dict[str, Any]
-    ) -> tuple[list[str], list[str], MessageType]:
-        """Download the signed URL inline; signed URLs expire ~1h."""
-        if self._client is None:
-            return [], [], MessageType.TEXT
-        try:
-            data = await self._client.fetch_attachment(attachment["url"])
-        except Exception as e:
-            logger.warning("Sabha: attachment fetch failed: %s", e)
-            return [], [], MessageType.DOCUMENT
-
-        content_type = (attachment.get("content_type") or "").lower()
-        filename = attachment.get("filename") or "attachment"
-        msg_type = MessageType.DOCUMENT
-        cache_path: Optional[str] = None
-
-        try:
-            for prefix, kind in _ATTACHMENT_KIND_BY_PREFIX.items():
-                if content_type.startswith(prefix):
-                    msg_type = kind
-                    break
-            if msg_type == MessageType.PHOTO:
-                cache_path = cache_image_from_bytes(
-                    data, _ext_from(filename, content_type, ".jpg")
-                )
-            elif msg_type == MessageType.AUDIO:
-                cache_path = cache_audio_from_bytes(
-                    data, _ext_from(filename, content_type, ".ogg")
-                )
-            else:
-                cache_path = cache_document_from_bytes(data, filename)
-        except Exception as e:
-            logger.warning("Sabha: attachment cache failed: %s", e)
-            return [], [], MessageType.DOCUMENT
-
-        if not cache_path:
-            return [], [], MessageType.DOCUMENT
-        return [cache_path], [content_type or "application/octet-stream"], msg_type
-
-
-# ---------------------------------------------------------------------------
-# Plugin registration
-# ---------------------------------------------------------------------------
+def _flag(config: Any, key: str, env: str, default: bool) -> bool:
+    raw = str(extra_or_secret(getattr(config, "extra", None) or {}, key, env, "", blank_is_unset=False))
+    return default if not raw.strip() else raw.strip().lower() not in {"false", "0", "no", "off"}
 
 
 def check_requirements() -> bool:
-    """Passive dependency probe — are this plugin's Python deps importable
-    right now?
-
-    ``register_platform`` treats ``check_fn`` as a side-effect-free "deps
-    present?" check (status displays call it freely, so it must never install
-    or touch config). Whether Sabha is *configured* is answered separately by
-    ``validate_config``. aiohttp is the only third-party dependency.
-    """
     try:
         import aiohttp  # noqa: F401
-    except Exception:
+        import markdown_it  # noqa: F401
+    except ImportError:
         return False
     return True
 
 
-def validate_config(config: Any) -> bool:
-    extra = _coerce_extra(config)
-    base_url = os.getenv("SABHA_BASE_URL") or extra.get("base_url", "")
-    bot_key = os.getenv("SABHA_BOT_KEY") or extra.get("bot_key", "")
-    return bool(base_url and bot_key)
+def validate_config(config: PlatformConfig) -> bool:
+    missing = [_ENV[name] for name in _ENV if not _setting(config, name)]
+    if missing:
+        logger.warning("Sabha: missing %s", ", ".join(missing))
+    return not missing
 
 
-def is_connected(config: Any) -> bool:
-    return validate_config(config)
+class SabhaAdapter(BasePlatformAdapter):
+    serial_receive_loop = True
+    splits_long_messages = True
+    supports_code_blocks = True
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config, Platform(PLATFORM))
+        self._api_url, self._socket_url, self._key = (_setting(config, n) for n in ("api_url", "websocket_url", "key"))
+        mode = str(extra_or_secret(config.extra, "reply_mode", "SABHA_REPLY_MODE", "thread")).strip().lower()
+        self._reply_in_thread = mode != "off"
+        self._reactions = _flag(config, "reactions", "SABHA_REACTIONS", True)
+        self._session: Any = None
+        self._api: Any = None
+        self._stream: Any = None
+        self._stream_task: Optional[asyncio.Task] = None
+        self._app_user_id = ""
+        self._app_name = ""
+        self._working: dict[str, str] = {}  # message id → id of the 👀 reaction on it
+        self._dedup = MessageDeduplicator(ttl_seconds=600)
+
+    # --- Lifecycle ---
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        import aiohttp
+        from .api import SabhaApi, SabhaApiError
+        from .cable import EventStream
+
+        if not (self._api_url and self._socket_url and self._key):
+            self._set_fatal_error("sabha_config", "SABHA_API_URL, SABHA_WEBSOCKET_URL and SABHA_APP_KEY are all "
+                                  "needed; copy them from the app's page in Sabha (Settings → Apps).", retryable=False)
+            return False
+        if not self._acquire_platform_lock("sabha-app-key", self._key, "Sabha app key"):
+            return False
+        self._session = aiohttp.ClientSession(trust_env=gateway_trust_env())
+        self._api = SabhaApi(self._session, self._api_url, self._key)
+        try:
+            me = await self._api.me()
+        except (SabhaApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            refused = isinstance(exc, SabhaApiError) and exc.status in (401, 403)
+            logger.error("Sabha: couldn't reach %s as the app (%s)", self._api_url, exc)
+            self._set_fatal_error("sabha_auth" if refused else "sabha_unreachable",
+                                  "Sabha refused the app key. Mint a new one on the app's page." if refused
+                                  else f"Couldn't reach Sabha at {self._api_url}: {exc}", retryable=not refused)
+            await self._close_session()
+            return False
+        self._app_user_id, self._app_name = str(me.get("id", "")), str(me.get("name", ""))
+        workspace = (me.get("workspace") or {}).get("name") or self._api_url
+        logger.info("Sabha: connected as %s (%s) in %s", self._app_name, self._app_user_id, workspace)
+
+        self._stream = EventStream(self._session, self._socket_url, self._key, self._on_event)
+        self._stream_task = asyncio.create_task(self._run_stream())
+        self._mark_connected()
+        return True
+
+    async def disconnect(self) -> None:
+        if self._stream is not None:
+            await self._stream.close()
+        await cancel_task(self._stream_task)
+        await self._close_session()
+        self._release_platform_lock()
+        self._mark_disconnected()
+
+    async def _close_session(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
+    async def _run_stream(self) -> None:
+        from .cable import KeyRefused
+        try:
+            await self._stream.run()
+        except asyncio.CancelledError:
+            raise
+        except KeyRefused as exc:
+            logger.error("Sabha: %s", exc)
+            self._set_fatal_error("sabha_auth", f"Sabha refused the app's event stream: {exc}. Check the app key "
+                                  "and the WebSocket URL on the app's page.", retryable=False)
+            await self._notify_fatal_error()
+
+    # --- Inbound ---
+
+    async def _on_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") != "message_created" or routing.is_from_self(event, self._app_user_id):
+            return
+        message, user, room = event.get("message") or {}, event.get("user") or {}, event.get("room") or {}
+        message_id = str(message.get("id", ""))
+        if not message_id or self._dedup.is_duplicate(message_id):
+            return
+
+        route = routing.inbound_route(event, reply_in_thread=self._reply_in_thread)
+        text = markup.strip_mention(routing.message_text(event), self._app_name)
+        media_urls, media_types = await self._download_attachment(message.get("attachment"))
+        if text.startswith("/"):
+            kind = MessageType.COMMAND
+        elif media_types:
+            kind = next((t for prefix, t, _, _ in _MEDIA_TYPES if media_types[0].startswith(prefix)),
+                        MessageType.DOCUMENT)
+        else:
+            kind = MessageType.TEXT
+
+        source = self.build_source(
+            chat_id=route.chat_id, chat_name=room.get("name") or None, chat_type=route.chat_type,
+            user_id=str(user.get("id", "")), user_name=user.get("name") or None, thread_id=route.thread_id,
+            message_id=message_id, is_bot=user.get("role") == "bot")
+        await self.handle_message(MessageEvent(
+            text=text, message_type=kind, source=source, raw_message=event, message_id=message_id,
+            media_urls=media_urls, media_types=media_types))
+
+    async def _download_attachment(self, attachment: Optional[dict]) -> tuple[list[str], list[str]]:
+        if not attachment or not attachment.get("url"):
+            return [], []
+        mime = attachment.get("content_type") or "application/octet-stream"
+        filename = attachment.get("filename") or "attachment"
+        try:
+            data = await self._api.download(attachment["url"])
+        except Exception as exc:
+            logger.warning("Sabha: couldn't download attachment %s (%s)", filename, exc)
+            return [], []
+        cache = next(((fn, ext) for prefix, _, fn, ext in _MEDIA_TYPES if mime.startswith(prefix)), None)
+        if cache:
+            path = await cache[0](data, Path(filename).suffix or cache[1])
+        else:
+            path = await cache_document_from_bytes_async(data, filename)
+        return [path], [mime]
+
+    # --- Outbound ---
+
+    async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
+                   metadata: _Metadata = None) -> SendResult:
+        if not content or not content.strip():
+            return SendResult(success=True)
+        result = SendResult(success=True)
+        for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+            result = await self._post(chat_id, markup.to_html(chunk), _thread_of(metadata))
+            if not result.success:
+                break
+        return result
+
+    async def _post(self, chat_id: str, html: str, thread_id: Optional[str]) -> SendResult:
+        from .api import SabhaApiError
+        try:
+            posted = await self._api.post_message(chat_id, html, parent_message_id=thread_id)
+        except SabhaApiError as exc:
+            if not (thread_id and exc.status in _THREAD_REFUSALS):
+                return _failed(exc)
+            logger.warning("Sabha: couldn't reply in the thread of %s (%s); posting in the room", thread_id, exc)
+            try:
+                posted = await self._api.post_message(chat_id, html)
+            except SabhaApiError as retry_exc:
+                return _failed(retry_exc)
+        except Exception as exc:
+            return SendResult(success=False, error=f"Sabha post failed: {exc}", retryable=True)
+        return SendResult(success=True, message_id=posted.id)
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *,
+                           finalize: bool = False) -> SendResult:
+        try:
+            await self._api.edit_message(message_id, markup.to_html(content[:MAX_MESSAGE_LENGTH]))
+        except Exception as exc:
+            return SendResult(success=False, error=f"Sabha edit failed: {exc}")
+        return SendResult(success=True, message_id=message_id)
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        try:
+            await self._api.delete_message(message_id)
+        except Exception as exc:
+            logger.debug("Sabha: couldn't delete %s (%s)", message_id, exc)
+            return False
+        return True
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        try:
+            room = await self._api.room(chat_id)
+        except Exception:
+            return {"name": chat_id, "type": "channel"}
+        kind = "dm" if room.get("type") == "Direct" else "channel"
+        return {"name": room.get("name") or chat_id, "type": kind}
+
+    # --- Files ---
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: _Metadata = None, **kwargs: Any) -> SendResult:
+        return await self._send_file(chat_id, image_path, caption, metadata)
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: _Metadata = None, **kwargs: Any) -> SendResult:
+        return await self._send_file(chat_id, file_path, caption, metadata, file_name)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: _Metadata = None, **kwargs: Any) -> SendResult:
+        return await self._send_file(chat_id, audio_path, caption, metadata)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: _Metadata = None, **kwargs: Any) -> SendResult:
+        return await self._send_file(chat_id, video_path, caption, metadata)
+
+    async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: _Metadata = None, **kwargs: Any) -> SendResult:
+        return await self.send(chat_id, f"{caption}\n\n{image_url}" if caption else image_url, metadata=metadata)
+
+    async def _send_file(self, chat_id: str, path: str, caption: Optional[str], metadata: _Metadata,
+                         file_name: Optional[str] = None) -> SendResult:
+        """A Sabha message holds a body or a file, not both, so a caption goes first on its own."""
+        from .api import SabhaApiError
+        if not Path(path).is_file():
+            return SendResult(success=False, error=f"File not found: {path}")
+        if caption:
+            sent = await self.send(chat_id, caption, metadata=metadata)
+            if not sent.success:
+                return sent
+        thread_id = _thread_of(metadata)
+        try:
+            posted = await self._api.post_file(chat_id, path, filename=file_name, parent_message_id=thread_id)
+        except SabhaApiError as exc:
+            if not (thread_id and exc.status in _THREAD_REFUSALS):
+                return _failed(exc)
+            try:
+                posted = await self._api.post_file(chat_id, path, filename=file_name)
+            except SabhaApiError as retry_exc:
+                return _failed(retry_exc)
+        except Exception as exc:
+            return SendResult(success=False, error=f"Sabha upload failed: {exc}")
+        return SendResult(success=True, message_id=posted.id)
+
+    # --- Working reaction ---
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        message_id = str(getattr(event, "message_id", "") or "")
+        if not (self._reactions and message_id) or message_id in self._working:
+            return
+        if self._sender_refused(event):
+            return
+        try:
+            self._working[message_id] = await self._api.add_reaction(message_id, WORKING_REACTION)
+        except Exception as exc:
+            logger.debug("Sabha: couldn't react to %s (%s)", message_id, exc)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        message_id = str(getattr(event, "message_id", "") or "")
+        reaction_id = self._working.pop(message_id, None)
+        if not reaction_id:
+            return
+        try:
+            await self._api.remove_reaction(message_id, reaction_id)
+        except Exception as exc:
+            logger.debug("Sabha: couldn't remove the reaction on %s (%s)", message_id, exc)
+
+    def _sender_refused(self, event: MessageEvent) -> bool:
+        """The gateway runs this hook before its allowlist, so without asking first a sender it's
+        about to turn away would still see 👀 flash on their message."""
+        check = getattr(self, "_is_sender_authorized", None)
+        source = getattr(event, "source", None)
+        if not callable(check) or source is None:
+            return False
+        return check(source.user_id, source.chat_type, source.chat_id,
+                     is_bot=bool(getattr(source, "is_bot", False)), thread_id=source.thread_id) is False
 
 
-def env_enablement() -> Optional[dict[str, Any]]:
-    """Seed ``PlatformConfig.extra`` from env vars BEFORE the adapter is
-    constructed, so env-only setups surface in ``hermes gateway status`` and
-    ``get_connected_platforms()`` without waiting for the SDK to instantiate.
-    Returns ``None`` when Sabha isn't minimally configured (the caller then
-    skips auto-enabling it)."""
-    base_url = (os.getenv("SABHA_BASE_URL") or "").strip()
-    bot_key = (os.getenv("SABHA_BOT_KEY") or "").strip()
-    if not (base_url and bot_key):
-        return None
-    seed: dict[str, Any] = {"base_url": base_url, "bot_key": bot_key}
-    for env_key, cfg_key in (
-        ("SABHA_API_BASE_URL", "api_base_url"),
-        ("SABHA_WEBSOCKET_URL", "websocket_url"),
-        ("SABHA_BOT_ID", "bot_id"),
-    ):
-        if value := (os.getenv(env_key) or "").strip():
-            seed[cfg_key] = value
-    # Home room for cron ``deliver=sabha`` and gateway notifications.
-    if home := (os.getenv("SABHA_HOME_CHANNEL") or "").strip():
-        seed["home_channel"] = {
-            "chat_id": home,
-            "name": os.getenv("SABHA_HOME_CHANNEL_NAME", home),
-        }
-    return seed
+def _thread_of(metadata: _Metadata) -> Optional[str]:
+    if isinstance(metadata, dict) and metadata.get("thread_id"):
+        return str(metadata["thread_id"])
+    return None
 
 
-async def standalone_send(
-    pconfig: Any,
-    chat_id: str,
-    message: str,
-    *,
-    thread_id: Optional[str] = None,
-    media_files: Optional[list[str]] = None,
-    force_document: bool = False,
-) -> dict[str, Any]:
-    """Out-of-process delivery for cron jobs (``deliver=sabha``) and the
-    ``send_message`` tool when they run separately from the gateway. Opens a
-    short-lived REST client, sends one message, and closes it.
+def _failed(exc: Any) -> SendResult:
+    retryable = getattr(exc, "status", 0) == 429 or getattr(exc, "status", 0) >= 500
+    return SendResult(success=False, error=str(exc), retryable=retryable)
 
-    ``thread_id`` routes into a thread (Sabha ``parent_message_id``).
-    ``media_files``/``force_document`` are accepted for signature parity with
-    the platform contract; attachment delivery is handled by the live adapter.
-    """
-    extra = _coerce_extra(pconfig)
-    base_url = _config_value(extra, "SABHA_BASE_URL", "base_url")
-    bot_key = _config_value(extra, "SABHA_BOT_KEY", "bot_key")
-    if not base_url or not bot_key:
-        return {"error": "SABHA_BASE_URL and SABHA_BOT_KEY must be configured"}
-    api_base_url = _api_base_url(
-        base_url, _config_value(extra, "SABHA_API_BASE_URL", "api_base_url")
-    )
-    client = SabhaClient(api_base_url, bot_key)
+
+# --- Out-of-process delivery (cron) ---
+
+async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
+                           media_files: Optional[list] = None, force_document: bool = False) -> dict[str, Any]:
+    import aiohttp
+    from .api import SabhaApi
+
+    api_url, key = _setting(pconfig, "api_url"), _setting(pconfig, "key")
+    if not (api_url and key):
+        return send_error("Sabha: SABHA_API_URL and SABHA_APP_KEY must both be set")
     try:
-        result = await client.send_message(
-            chat_id, message, parent_message_id=thread_id
-        )
-    except Exception as e:
-        return {"error": f"Sabha standalone send failed: {e}"}
-    finally:
-        await client.close()
-    if result is None:
-        return {"error": "Sabha returned an empty/malformed send response"}
-    return {"success": True, "message_id": str(result["id"])}
+        async with aiohttp.ClientSession(trust_env=gateway_trust_env()) as session:
+            api = SabhaApi(session, api_url, key)
+            last_id = None
+            if message and message.strip():
+                last_id = (await api.post_message(chat_id, markup.to_html(message),
+                                                  parent_message_id=thread_id)).id
+            for media in media_files or []:
+                path = media.get("path") if isinstance(media, dict) else media
+                if path and Path(path).is_file():
+                    last_id = (await api.post_file(chat_id, path, parent_message_id=thread_id)).id
+        return {"success": True, "platform": PLATFORM, "chat_id": chat_id, "message_id": last_id}
+    except Exception as exc:
+        return send_error(f"Sabha send failed: {exc}")
+
+
+# --- Configuration ---
+
+def _env_enablement() -> dict | None:
+    if not all(get_scoped_secret(env, "").strip() for env in _ENV.values()):
+        return None
+    return seed_extra_from_env(
+        (("SABHA_API_URL", "api_url", None), ("SABHA_WEBSOCKET_URL", "websocket_url", None),
+         ("SABHA_APP_KEY", "key", None), ("SABHA_REPLY_MODE", "reply_mode", None),
+         ("SABHA_REACTIONS", "reactions", None)),
+        home_env="SABHA_HOME_CHANNEL")
+
+
+_YAML_BRIDGE = (("reply_mode", "SABHA_REPLY_MODE", "str"), ("reactions", "SABHA_REACTIONS", "lower"))
+
+
+def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
+    return apply_yaml_bridge(platform_cfg, _YAML_BRIDGE)
 
 
 def interactive_setup() -> None:
-    """Hermes ``gateway setup`` flow for Sabha."""
-    from hermes_cli.setup import (
-        prompt,
-        prompt_yes_no,
-        save_env_value,
-        get_env_value,
-        print_header,
-        print_info,
-        print_warning,
-        print_success,
-    )
+    from hermes_cli.cli_output import print_info, print_success, print_warning
+    from hermes_cli.gateway_setup_wizard import confirm_reconfigure, print_setup_header, prompt_csv, save_env_values
+    from hermes_cli.setup import prompt
 
-    print_header("Sabha")
-    existing = get_env_value("SABHA_BASE_URL")
-    if existing:
-        print_info(f"Sabha: already configured (base URL: {existing})")
-        if not prompt_yes_no("Reconfigure Sabha?", False):
-            return
-
-    print_info(
-        "Connect Hermes to a Sabha workspace. You'll need a bot key from "
-        "your Sabha admin console."
-    )
-    print()
-
-    base_url = prompt(
-        "Sabha base URL (e.g. https://sabha.co/1000006)",
-        default=existing or "",
-    )
-    if not base_url:
-        print_warning("Base URL is required — skipping Sabha setup")
+    print_setup_header("Sabha")
+    if not confirm_reconfigure("Sabha", *_ENV.values()):
         return
-    save_env_value("SABHA_BASE_URL", base_url.strip())
-
-    bot_key = prompt("Bot key (format: bot_id-token)", password=True)
-    if not bot_key:
-        print_warning("Bot key is required — skipping Sabha setup")
-        return
-    save_env_value("SABHA_BOT_KEY", bot_key.strip())
-
-    if prompt_yes_no("Override the WebSocket URL? (uncommon)", False):
-        ws_url = prompt(
-            "WebSocket URL (e.g. wss://sabha.co/cable)",
-            default=get_env_value("SABHA_WEBSOCKET_URL") or "",
-        )
-        if ws_url:
-            save_env_value("SABHA_WEBSOCKET_URL", ws_url.strip())
-
+    print_info("  In Sabha, an admin creates the app: Settings → Apps → New.")
+    print_info("  Its page shows the API base URL, the WebSocket URL and the key (once).")
+    print_info("  Add the app to the rooms it should work in; DMs work without that.")
     print()
-    print_info("🔒 Access control")
-    allow_all = prompt_yes_no(
-        "Allow all senders the bot can see to talk to it?", False
-    )
-    if allow_all:
-        save_env_value("SABHA_ALLOW_ALL_USERS", "true")
-        save_env_value("SABHA_ALLOWED_USERS", "")
-        print_warning("⚠️  Open access — any visible user can command the bot.")
+    api_url = prompt("API base URL (e.g. https://chat.example.com/api/v1)").strip().rstrip("/")
+    socket_url = prompt("WebSocket URL (e.g. wss://chat.example.com/cable)").strip()
+    key = prompt("App key (sabha_app_…)", password=True).strip()
+    if not (api_url and socket_url and key):
+        print_warning("  All three are needed; nothing saved.")
+        return
+    save_env_values(SABHA_API_URL=api_url, SABHA_WEBSOCKET_URL=socket_url, SABHA_APP_KEY=key)
+    print_success("  Sabha app saved")
+    print()
+    print_info("  Who may talk to the agent? A user's id is the number in their profile URL (/users/42).")
+    allowed = prompt_csv("Allowed user ids (comma-separated, empty for none yet)", "")
+    if allowed:
+        save_env_values(SABHA_ALLOWED_USERS=allowed)
+        print_success("  Allowlist saved")
     else:
-        save_env_value("SABHA_ALLOW_ALL_USERS", "false")
-        allowed = prompt(
-            "Allowed user ids (comma-separated, leave empty to deny everyone)",
-            default=get_env_value("SABHA_ALLOWED_USERS") or "",
-        )
-        save_env_value("SABHA_ALLOWED_USERS", (allowed or "").replace(" ", ""))
-
-    print()
-    print_success("Sabha configuration saved to ~/.hermes/.env")
-    print_info("Restart the gateway: hermes gateway restart")
+        print_info("  No allowlist: unknown people get a pairing code to approve with `hermes pairing approve sabha`.")
+    home = prompt("Home room id for cron results (optional; the number in /rooms/12)").strip()
+    if home:
+        save_env_values(SABHA_HOME_CHANNEL=home)
 
 
-def register(ctx: Any) -> None:
-    """Plugin entry point — Hermes' plugin loader calls this."""
-    ctx.register_platform(
-        name="sabha",
-        label="Sabha",
-        adapter_factory=lambda cfg: SabhaAdapter(cfg),
-        check_fn=check_requirements,
-        validate_config=validate_config,
-        is_connected=is_connected,
-        setup_fn=interactive_setup,
-        env_enablement_fn=env_enablement,  # env-only setups show in gateway status
-        cron_deliver_env_var="SABHA_HOME_CHANNEL",  # cron deliver=sabha target
-        standalone_sender_fn=standalone_send,  # cron/send_message outside the gateway
-        required_env=["SABHA_BASE_URL", "SABHA_BOT_KEY"],
-        install_hint="pip install aiohttp",
-        allowed_users_env="SABHA_ALLOWED_USERS",
-        allow_all_env="SABHA_ALLOW_ALL_USERS",
-        max_message_length=_DEFAULT_MAX_MESSAGE_LENGTH,
-        pii_safe=True,
-        emoji="🪷",
-        allow_update_command=True,
-        platform_hint=(
-            "You are on Sabha — NOT Discord, Slack, Teams, or Telegram. "
-            "Mention users by `@{user_id}` (numeric) using the user id from "
-            "the inbound payload. Sabha renders standard markdown including "
-            "h2–h6, lists, code fences, links, and inline emphasis. Tables "
-            "are not supported and will be downgraded to preformatted text "
-            "— prefer lists or short paragraphs instead."
-        ),
+_PLATFORM_HINT = (
+    "You are in Sabha, a team chat app, talking with your user. Write standard Markdown: bold, italics, "
+    "headings, lists, links, blockquotes and code blocks all render. Tables don't, so use lists instead. "
+    "To mention someone, write @{user_id} with their numeric Sabha id; it notifies them only if they are "
+    "in this room. To send a file, include MEDIA:/absolute/path/to/file in your response."
+)
+
+
+# register_platform's own parameters; everything else is a PlatformEntry field, dropped on older cores.
+_REGISTER_ARGS = {"name", "label", "adapter_factory", "check_fn", "validate_config", "required_env", "install_hint"}
+
+
+def register(ctx) -> None:
+    import dataclasses
+    from gateway.platform_registry import PlatformEntry
+
+    kwargs: dict[str, Any] = dict(
+        name=PLATFORM, label="Sabha", adapter_factory=SabhaAdapter, check_fn=check_requirements,
+        validate_config=validate_config, required_env=list(_ENV.values()),
+        install_hint="Install this plugin's Python dependencies (aiohttp, markdown-it-py), then restart the gateway",
+        setup_fn=interactive_setup, env_enablement_fn=_env_enablement, apply_yaml_config_fn=_apply_yaml_config,
+        is_connected=env_is_connected(*_ENV.values()),
+        cron_deliver_env_var="SABHA_HOME_CHANNEL", standalone_sender_fn=_standalone_send,
+        allowed_users_env="SABHA_ALLOWED_USERS", allow_all_env="SABHA_ALLOW_ALL_USERS",
+        max_message_length=MAX_MESSAGE_LENGTH, platform_hint=_PLATFORM_HINT, emoji="🪷",
     )
+    known = {f.name for f in dataclasses.fields(PlatformEntry)}
+    for key, value in (("allowlist_suppresses_pairing", True), ("display_tier", "medium"),
+                       ("dashboard_description", "Connect Hermes to a Sabha workspace as an app."),
+                       ("docs_url", "https://github.com/sabha-co/hermes-sabha")):
+        if key in known:
+            kwargs[key] = value
+    ctx.register_platform(**{k: v for k, v in kwargs.items() if k in known or k in _REGISTER_ARGS})

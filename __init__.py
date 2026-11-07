@@ -1,10 +1,10 @@
-"""Sabha platform plugin for Hermes Agent.
+"""Sabha platform plugin for Hermes Agent."""
 
-The Hermes plugin loader imports this package and calls ``register(ctx)``.
-Keep the entry point re-exported here so a directory plugin dropped into
-``~/.hermes/plugins/`` is discovered without extra configuration.
-"""
 
-from .adapter import register
+def register(ctx) -> None:
+    from .adapter import register as register_adapter
+
+    register_adapter(ctx)
+
 
 __all__ = ["register"]

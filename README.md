@@ -1,111 +1,92 @@
 # hermes-sabha
 
-Run a [Hermes Agent](https://github.com/NousResearch/hermes-agent) bot on a [Sabha](https://sabha.co) workspace.
+Run a [Hermes Agent](https://github.com/NousResearch/hermes-agent) in a [Sabha](https://sabha.co) workspace.
 
-Drop-in plugin — clone into `~/.hermes/plugins/`, point it at a Sabha bot key, restart the gateway. No fork of Hermes required.
+Hermes joins Sabha as an **app**. It hears events over the app WebSocket and answers through the
+apps API, so it needs no public URL and can run on a laptop behind NAT. It brings its own model
+and tools; Sabha is where people talk to it.
 
 ## Install
 
 ```bash
 hermes plugins install sabha-co/hermes-sabha
-hermes plugins enable sabha-platform   # user-installed plugins are opt-in
-hermes gateway setup                   # walks you through Sabha credentials
-hermes gateway restart
-```
-
-Or clone manually if you'd rather pin to a specific commit:
-
-```bash
-git clone https://github.com/sabha-co/hermes-sabha ~/.hermes/plugins/sabha
 hermes plugins enable sabha-platform
-hermes gateway setup
+hermes gateway setup      # pick Sabha
 hermes gateway restart
 ```
 
-Verify it loaded:
+`hermes status` should then list Sabha under messaging platforms.
 
-```bash
-hermes status
-```
+## Create the app in Sabha
 
-You should see Sabha listed under Messaging Platforms with a `(plugin)` tag.
-
-## Get a Sabha bot key
-
-1. Open your Sabha workspace as an administrator.
-2. Settings → Integrations → Bots → **New bot**.
-3. Copy the bot key (format `123-AbCdEfGh…`) and the workspace base URL (e.g. `https://sabha.co/1000006`).
-4. Add the bot to the rooms you want it to participate in.
+1. As an admin: **Settings → Apps → New**.
+2. From the app's page, copy the **API base URL**, the **WebSocket URL** and the **key**. The key is
+   shown once.
+3. Add the app to the rooms it should work in. DMs work without that.
 
 ## Configure
 
-Easiest path is the wizard (`hermes gateway setup`, pick Sabha). It writes to `~/.hermes/.env`. The variables it sets:
+`hermes gateway setup` writes these to `~/.hermes/.env`:
 
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `SABHA_BASE_URL` | yes | Workspace URL, e.g. `https://sabha.co/1000006` |
-| `SABHA_BOT_KEY` | yes | Bot key from step 3 above |
-| `SABHA_ALLOWED_USERS` | recommended | Comma-separated Sabha user ids permitted to talk to the bot |
-| `SABHA_ALLOW_ALL_USERS` | optional | Set `true` to skip the allowlist (open access) |
-| `SABHA_WEBSOCKET_URL` | optional | Override if your deployment terminates `/cable` somewhere unusual |
-| `SABHA_API_BASE_URL` | optional | Override if your bot API isn't at `{BASE_URL}/api/bots` |
+| Variable | Required | |
+|---|---|---|
+| `SABHA_API_URL` | yes | API base URL, e.g. `https://chat.example.com/api/v1` |
+| `SABHA_WEBSOCKET_URL` | yes | WebSocket URL, e.g. `wss://chat.example.com/cable`. Paste it as shown; the key is sent as a header and dropped from the URL |
+| `SABHA_APP_KEY` | yes | The app's key, `sabha_app_…` |
+| `SABHA_ALLOWED_USERS` | recommended | Comma-separated Sabha user ids allowed to talk to the agent (the number in `/users/42`) |
+| `SABHA_ALLOW_ALL_USERS` | | `true` lets anyone in the workspace use it |
+| `SABHA_HOME_CHANNEL` | | Room id for cron results (the number in `/rooms/12`) |
+| `SABHA_REPLY_MODE` | | `thread` (default) answers a room mention in a thread; `off` answers in the room |
+| `SABHA_REACTIONS` | | `true` (default) reacts 👀 while the agent is working |
 
-Equivalent `config.yaml` block:
+With no allowlist, someone new gets a pairing code to approve with `hermes pairing approve sabha <code>`.
+
+The same settings can live in `config.yaml`:
 
 ```yaml
-gateway:
-  platforms:
-    sabha:
-      enabled: true
-      extra:
-        base_url: https://sabha.co/1000006
-        bot_key: "${SABHA_BOT_KEY}"
+platforms:
+  sabha:
+    enabled: true
+    extra:
+      api_url: https://chat.example.com/api/v1
+      websocket_url: wss://chat.example.com/cable
+      reply_mode: thread
 ```
 
-## Try it
+## How it behaves
 
-DM the bot, or @-mention it in a room it's a member of. The agent replies in the same room — or in a thread if you replied to a message in a non-DM room.
+- **Who it hears.** Sabha sends an app a room message only when it's mentioned. In a DM, or a
+  thread the app is in, it gets every message. It never hears its own messages, and hears another
+  app only when that app mentions it by name.
+- **Threads.** A room mention is answered in a thread on that message, and the thread is its own
+  Hermes session. Follow-ups in the thread need no mention. DMs never thread.
+- **Formatting.** The agent writes Markdown, which is rendered to the rich text Sabha stores. Raw
+  HTML is escaped. Tables don't render. `@{42}` mentions user 42 if they're in the room.
+- **Streaming.** With Hermes' streaming on (`streaming.enabled: true` in `config.yaml`; it's off
+  by default), answers stream in by editing the reply in place. Otherwise each reply lands whole.
+- **Files.** Attachments people send are downloaded for the agent. Files the agent sends are posted
+  as attachments, with any caption as a message just before.
+- **Commands.** A message starting with `/` that Sabha doesn't claim reaches Hermes as a command
+  (`/new`, `/stop`…).
+- **Cron.** `deliver=sabha` posts to `SABHA_HOME_CHANNEL`, from the gateway or from a separate
+  `hermes cron` process.
 
+Sabha keeps no backlog for a disconnected app: messages sent while the socket is down aren't
+replayed.
+
+## Not yet
+
+- Hermes' approval and clarify buttons as Sabha Block Kit cards (Sabha supports them; they come
+  back as `block_actions` events).
+- Hermes' commands in Sabha's `/` menu, through `PUT /profile/commands` and `command` events.
+- Webhook delivery instead of the WebSocket.
+
+## Development
+
+```bash
+uv run --no-project --with pytest --with markdown-it-py python -m pytest
 ```
-You: @{42} what's on the calendar today?
-Bot: …
-```
 
-To mention users from agent output, use the literal `@{user_id}` token (numeric id) — Sabha rewrites it into a real mention server-side. The user id appears in the inbound message payload the agent sees.
-
-## What's supported
-
-- **Text in / text out**, with Sabha-flavoured markdown rendering (bold, italics, headings up to h6, code fences, lists, links, blockquotes).
-- **Streaming replies** via in-place edits — the bot's message updates as the agent generates, instead of arriving all at once.
-- **Threading** — replying to a message inside a non-DM room continues in a thread automatically.
-- **Inbound attachments** — images, audio and documents are downloaded and made available to the agent's vision/audio tools.
-- **Outbound attachments** — images, documents, audio and video from local files are uploaded natively (`send_image_file`, `send_document`, `send_voice`, `send_video`). Captions are delivered as a follow-up message in the same room/thread, since Sabha uploads carry no caption field. `send_image` with a remote URL falls back to posting the link as text.
-- **Edit / delete / react** on prior bot messages.
-- **Allowlist** integration with Hermes' standard `*_ALLOWED_USERS` mechanism.
-
-## Not yet supported (v0.1)
-
-- Typing indicator while the agent is thinking.
-- Listing rooms / users from agent tool calls.
-- Running multiple Sabha bots from one Hermes installation (use a second `HERMES_HOME` for now).
-- Custom per-room system prompts.
-
-## Notes for Sabha-specific behaviour
-
-- **Markdown tables** render as preformatted text — Sabha's HTML allowlist doesn't include `<table>`. If your agent likes tables, prefer lists or short paragraphs; the platform hint shipped with the plugin nudges it that way.
-- **Replies vs threads** — replying to a top-level message in a public/private room threads automatically; DMs always reply inline.
-- **Attachment URLs are short-lived** — Sabha's signed URLs expire in roughly an hour. The plugin caches inbound attachments to disk on arrival, so the agent can still process a file the user sent earlier in the turn.
-
-## Troubleshooting
-
-| Symptom | Likely cause |
-| --- | --- |
-| `hermes status` doesn't list Sabha | Plugin didn't load — check `~/.hermes/plugins/sabha/plugin.yaml` exists and `hermes gateway logs` for import errors. |
-| `auth_failed` in logs at startup | `SABHA_BOT_KEY` rejected — regenerate the bot key in Sabha settings. |
-| Bot ignores group messages | In rooms (not DMs) the bot only replies when @-mentioned. Mention it explicitly. |
-| `config_missing` fatal error | `SABHA_BASE_URL` or `SABHA_BOT_KEY` isn't set in the environment Hermes is running under. |
-| Bot replies in the wrong place after a reconnect | Restart the gateway; the WebSocket should resubscribe and resume. File an issue if it persists. |
-
-## License
-
-MIT.
+The tests cover routing and formatting, which don't need Hermes installed. The adapter itself is
+checked against a running Hermes gateway and Sabha. The full API reference is `GET /skill` on any
+Sabha workspace.
