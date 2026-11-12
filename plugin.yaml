@@ -6,7 +6,7 @@ description: >
   Sabha gateway adapter for Hermes Agent. Joins a Sabha workspace as an app:
   hears mentions, DMs and threads over the app WebSocket (AppEventsChannel),
   and replies through the apps API (/api/v1) with threads, streamed edits,
-  reactions and file attachments. Needs no public URL.
+  a status line while it works, and file attachments. Needs no public URL.
 author: Sabha
 license: MIT
 homepage: https://github.com/sabha-co/hermes-sabha
@@ -40,8 +40,4 @@ optional_env:
   - name: SABHA_REPLY_MODE
     description: "Reply to a room mention in a thread ('thread', the default) or in the room ('off')"
     prompt: "Reply mode (thread|off)"
-    password: false
-  - name: SABHA_REACTIONS
-    description: "React 👀 to a message while working on it (default true)"
-    prompt: "Working reaction? (true/false)"
     password: false

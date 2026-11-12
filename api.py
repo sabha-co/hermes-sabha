@@ -64,12 +64,13 @@ class SabhaApi:
     async def delete_message(self, message_id: str) -> None:
         await self._request("DELETE", f"/messages/{message_id}")
 
-    async def add_reaction(self, message_id: str, emoji: str) -> str:
-        data = await self._request("POST", f"/messages/{message_id}/reactions", text=emoji)
-        return str(data["id"])
+    async def set_status(self, room_id: str, status: str, *, parent_message_id: Optional[str] = None) -> None:
+        """The line under the app's working shell where its reply will land; posting there clears it."""
+        await self._request("PUT", f"/rooms/{room_id}/status",
+                            json={"status": status, **({"parent_message_id": parent_message_id} if parent_message_id else {})})
 
-    async def remove_reaction(self, message_id: str, reaction_id: str) -> None:
-        await self._request("DELETE", f"/messages/{message_id}/reactions/{reaction_id}")
+    async def clear_status(self, room_id: str, *, parent_message_id: Optional[str] = None) -> None:
+        await self._request("DELETE", f"/rooms/{room_id}/status", params=_thread_params(parent_message_id))
 
     async def download(self, url: str) -> bytes:
         """Fetch an attachment by its signed URL, which carries its own credential."""
@@ -94,13 +95,9 @@ class SabhaApi:
             data = await self._request("POST", path, params=params, **request({}))
         return Posted(str(data["id"]), str(data["room_id"]))
 
-    async def _request(self, method: str, path: str, *, json: Any = None, text: Optional[str] = None,
-                       data: Any = None, params: Optional[dict] = None, timeout: float = 30) -> dict[str, Any]:
-        headers = dict(self._auth)
-        if text is not None:
-            headers["Content-Type"] = "text/plain; charset=utf-8"
-            data = text.encode()
-        async with self._session.request(method, self._base + path, headers=headers, json=json, data=data,
+    async def _request(self, method: str, path: str, *, json: Any = None, data: Any = None,
+                       params: Optional[dict] = None, timeout: float = 30) -> dict[str, Any]:
+        async with self._session.request(method, self._base + path, headers=self._auth, json=json, data=data,
                                          params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             if resp.status == 204:
                 return {}

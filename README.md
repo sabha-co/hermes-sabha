@@ -24,6 +24,10 @@ hermes gateway restart
    shown once.
 3. Add the app to the rooms it should work in. DMs work without that.
 
+A new app's key can post and read, which is all Hermes needs: it answers in DMs people open with
+it, and never opens one itself. Leave **Start direct messages** and **Create and join rooms** off
+under "What its key can do" on the app's page.
+
 ## Configure
 
 `hermes gateway setup` writes these to `~/.hermes/.env`:
@@ -37,7 +41,6 @@ hermes gateway restart
 | `SABHA_ALLOW_ALL_USERS` | | `true` lets anyone in the workspace use it |
 | `SABHA_HOME_CHANNEL` | | Room id for cron results (the number in `/rooms/12`) |
 | `SABHA_REPLY_MODE` | | `thread` (default) answers a room mention in a thread; `off` answers in the room |
-| `SABHA_REACTIONS` | | `true` (default) reacts 👀 while the agent is working |
 
 With no allowlist, someone new gets a pairing code to approve with `hermes pairing approve sabha <code>`.
 
@@ -62,6 +65,9 @@ platforms:
   Hermes session. Follow-ups in the thread need no mention. DMs never thread.
 - **Formatting.** The agent writes Markdown, which is rendered to the rich text Sabha stores. Raw
   HTML is escaped. Tables don't render. `@{42}` mentions user 42 if they're in the room.
+- **Working.** While the agent works, a shell with a status line shows where its reply will land:
+  "Thinking…", then Hermes' live phrases as it runs tools. The reply replaces it. A sender outside
+  the allowlist sees nothing.
 - **Streaming.** With Hermes' streaming on (`streaming.enabled: true` in `config.yaml`; it's off
   by default), answers stream in by editing the reply in place. Otherwise each reply lands whole.
 - **Files.** Attachments people send are downloaded for the agent. Files the agent sends are posted

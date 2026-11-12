@@ -11,7 +11,9 @@ Environment (or ``platforms.sabha.extra`` in config.yaml):
     SABHA_ALLOWED_USERS  Comma-separated Sabha user ids allowed to talk to the agent
     SABHA_HOME_CHANNEL   Room id for cron and notification delivery
     SABHA_REPLY_MODE     "thread" (default) answers a room mention in a thread; "off" in the room
-    SABHA_REACTIONS      "true" (default) reacts 👀 while the agent works on a message
+
+While the agent works, Hermes's typing indicator and its live phrases ("Searching the web…") show as
+the app's status: the line under a working shell where the reply will land.
 """
 
 from __future__ import annotations
@@ -35,11 +37,11 @@ from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 from . import markup
 from . import routing
 from .retries import RetryIds
+from .status import StatusLines
 
 logger = logging.getLogger(__name__)
 
 PLATFORM = "sabha"
-WORKING_REACTION = "👀"
 
 # Sabha has no hard cap this small; it keeps a streamed reply's edits cheap and a long answer readable.
 MAX_MESSAGE_LENGTH = 12000
@@ -55,11 +57,6 @@ _MEDIA_TYPES = (("image/", MessageType.PHOTO, cache_image_from_bytes_async, ".pn
 
 def _setting(config: Any, name: str, default: str = "") -> str:
     return str(extra_or_secret(getattr(config, "extra", None) or {}, name, _ENV[name], default) or "").strip()
-
-
-def _flag(config: Any, key: str, env: str, default: bool) -> bool:
-    raw = str(extra_or_secret(getattr(config, "extra", None) or {}, key, env, "", blank_is_unset=False))
-    return default if not raw.strip() else raw.strip().lower() not in {"false", "0", "no", "off"}
 
 
 def check_requirements() -> bool:
@@ -82,20 +79,20 @@ class SabhaAdapter(BasePlatformAdapter):
     serial_receive_loop = True
     splits_long_messages = True
     supports_code_blocks = True
+    supports_status_text = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(PLATFORM))
         self._api_url, self._socket_url, self._key = (_setting(config, n) for n in ("api_url", "websocket_url", "key"))
         mode = str(extra_or_secret(config.extra, "reply_mode", "SABHA_REPLY_MODE", "thread")).strip().lower()
         self._reply_in_thread = mode != "off"
-        self._reactions = _flag(config, "reactions", "SABHA_REACTIONS", True)
         self._session: Any = None
         self._api: Any = None
         self._stream: Any = None
         self._stream_task: Optional[asyncio.Task] = None
         self._app_user_id = ""
         self._app_name = ""
-        self._working: dict[str, str] = {}  # message id → id of the 👀 reaction on it
+        self._status_lines = StatusLines()
         self._dedup = MessageDeduplicator(ttl_seconds=600)
         self._retry_ids = RetryIds()
 
@@ -235,8 +232,10 @@ class SabhaAdapter(BasePlatformAdapter):
                 posted = await self._api.post_message(chat_id, html, client_message_id=client_message_id)
             except SabhaApiError as retry_exc:
                 return _failed(retry_exc)
+            thread_id = None
         except Exception as exc:
             return SendResult(success=False, error=f"Sabha post failed: {exc}", retryable=True)
+        self._status_lines.posted((str(chat_id), thread_id))
         return SendResult(success=True, message_id=posted.id)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *,
@@ -317,36 +316,40 @@ class SabhaAdapter(BasePlatformAdapter):
                                                    client_message_id=client_message_id)
             except SabhaApiError as retry_exc:
                 return _failed(retry_exc)
+            thread_id = None
         except Exception as exc:
             return SendResult(success=False, error=f"Sabha upload failed: {exc}", retryable=True)
+        self._status_lines.posted((str(chat_id), thread_id))
         return SendResult(success=True, message_id=posted.id)
 
-    # --- Working reaction ---
+    # --- Status line ---
+
+    async def send_typing(self, chat_id: str, metadata: _Metadata = None) -> None:
+        place = (str(chat_id), _thread_of(metadata))
+        line = self._status_lines.due(place, getattr(self, "_status_text", {}).get(str(chat_id)))
+        if not (line and self._api):
+            return
+        try:
+            await self._api.set_status(place[0], line, parent_message_id=place[1])
+        except Exception as exc:
+            logger.debug("Sabha: couldn't set the status in %s (%s)", chat_id, exc)
+            return
+        self._status_lines.sent(place, line)
+
+    async def stop_typing(self, chat_id: str, metadata: _Metadata = None) -> None:
+        for room_id, thread_id in self._status_lines.finish(str(chat_id), _thread_of(metadata)):
+            try:
+                await self._api.clear_status(room_id, parent_message_id=thread_id)
+            except Exception as exc:
+                logger.debug("Sabha: couldn't clear the status in %s (%s)", room_id, exc)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        message_id = str(getattr(event, "message_id", "") or "")
-        if not (self._reactions and message_id) or message_id in self._working:
-            return
         if self._sender_refused(event):
-            return
-        try:
-            self._working[message_id] = await self._api.add_reaction(message_id, WORKING_REACTION)
-        except Exception as exc:
-            logger.debug("Sabha: couldn't react to %s (%s)", message_id, exc)
-
-    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
-        message_id = str(getattr(event, "message_id", "") or "")
-        reaction_id = self._working.pop(message_id, None)
-        if not reaction_id:
-            return
-        try:
-            await self._api.remove_reaction(message_id, reaction_id)
-        except Exception as exc:
-            logger.debug("Sabha: couldn't remove the reaction on %s (%s)", message_id, exc)
+            self._status_lines.quiet(str(event.source.chat_id))
 
     def _sender_refused(self, event: MessageEvent) -> bool:
-        """The gateway runs this hook before its allowlist, so without asking first a sender it's
-        about to turn away would still see 👀 flash on their message."""
+        """The gateway runs this hook, and starts typing, before its allowlist, so without asking first
+        a sender it's about to turn away would still see a working shell flash up."""
         check = getattr(self, "_is_sender_authorized", None)
         source = getattr(event, "source", None)
         if not callable(check) or source is None:
@@ -399,12 +402,11 @@ def _env_enablement() -> dict | None:
         return None
     return seed_extra_from_env(
         (("SABHA_API_URL", "api_url", None), ("SABHA_WEBSOCKET_URL", "websocket_url", None),
-         ("SABHA_APP_KEY", "key", None), ("SABHA_REPLY_MODE", "reply_mode", None),
-         ("SABHA_REACTIONS", "reactions", None)),
+         ("SABHA_APP_KEY", "key", None), ("SABHA_REPLY_MODE", "reply_mode", None)),
         home_env="SABHA_HOME_CHANNEL")
 
 
-_YAML_BRIDGE = (("reply_mode", "SABHA_REPLY_MODE", "str"), ("reactions", "SABHA_REACTIONS", "lower"))
+_YAML_BRIDGE = (("reply_mode", "SABHA_REPLY_MODE", "str"),)
 
 
 def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:

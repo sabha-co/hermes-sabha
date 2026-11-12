@@ -67,3 +67,12 @@ def test_any_other_refusal_is_raised():
     with pytest.raises(SabhaApiError):
         post(session, client_message_id="id-1")
     assert len(session.requests) == 1
+
+
+def test_a_status_names_its_place_and_a_clear_takes_the_thread_as_a_parameter():
+    session = Session((200, {"draft_id": "d-1"}), (204, {}))
+    api = SabhaApi(session, "https://chat.test/api/v1", "key")
+    asyncio.run(api.set_status("5", "Thinking…", parent_message_id="80"))
+    asyncio.run(api.clear_status("5", parent_message_id="80"))
+    assert session.requests[0]["json"] == {"status": "Thinking…", "parent_message_id": "80"}
+    assert session.requests[1]["params"] == {"parent_message_id": "80"}
