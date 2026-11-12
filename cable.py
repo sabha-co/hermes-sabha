@@ -3,7 +3,8 @@
 Sabha's WebSocket is AnyCable speaking the Action Cable JSON protocol. The server greets with
 ``welcome``, pings every few seconds, confirms the subscription, then sends each event as
 ``{"identifier", "message"}``. A ``disconnect`` frame with ``reconnect: false`` means the key was
-refused. There is no replay: events sent while the socket is down are gone.
+refused. The extended protocol stamps each event with its stream position, and a ``history``
+request after subscribing replays what was missed (see ``replay.py``).
 """
 
 from __future__ import annotations
@@ -12,10 +13,13 @@ import asyncio
 import json
 import logging
 import random
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
+
+if TYPE_CHECKING:
+    from .replay import Replay
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +45,9 @@ def socket_url(url: str) -> str:
 class EventStream:
     def __init__(self, session: aiohttp.ClientSession, url: str, key: str,
                  on_event: Callable[[dict[str, Any]], Awaitable[None]],
-                 on_subscribed: Callable[[], Awaitable[None]] | None = None):
+                 on_subscribed: Callable[[], Awaitable[None]] | None = None, replay: Optional[Replay] = None):
         self._session, self._url, self._key = session, socket_url(url), key
-        self._on_event, self._on_subscribed = on_event, on_subscribed
+        self._on_event, self._on_subscribed, self._replay = on_event, on_subscribed, replay
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._closing = False
 
@@ -86,7 +90,7 @@ class EventStream:
         try:
             self._ws = await self._session.ws_connect(
                 self._url, headers={"Authorization": f"Bearer {self._key}"},
-                protocols=("actioncable-v1-json",), heartbeat=None, autoping=True)
+                protocols=("actioncable-v1-ext-json",), heartbeat=None, autoping=True)
         except aiohttp.WSServerHandshakeError as exc:
             if exc.status in (401, 403):
                 raise KeyRefused(f"WebSocket handshake refused (HTTP {exc.status})") from exc
@@ -115,8 +119,17 @@ class EventStream:
                 elif kind == "confirm_subscription":
                     subscribed = True
                     logger.info("Sabha: subscribed to app events")
+                    history = self._replay.history() if self._replay else None
+                    if self._replay:
+                        self._replay.subscribed()
+                    if history:
+                        await self._ws.send_json({"command": "history", "identifier": IDENTIFIER, "history": history})
                     if self._on_subscribed:
                         await self._on_subscribed()
+                elif kind == "confirm_history":
+                    logger.info("Sabha: replaying missed events")
+                elif kind == "reject_history":
+                    logger.warning("Sabha: couldn't replay missed events (history expired, or Sabha restarted)")
                 elif kind == "reject_subscription":
                     raise KeyRefused("AppEventsChannel refused the subscription: the key isn't an app's")
                 elif kind == "disconnect":
@@ -128,7 +141,12 @@ class EventStream:
                         await self._on_event(msg["message"])
                     except Exception:
                         logger.exception("Sabha: event handler failed")
+                    # Handled, or failed past retrying: either way, a replay shouldn't bring it back.
+                    if self._replay:
+                        self._replay.handled(msg.get("stream_id"), msg.get("epoch"), msg.get("offset"))
             return subscribed
         finally:
+            if subscribed and self._replay:
+                self._replay.disconnected()
             if not self._ws.closed:
                 await self._ws.close()

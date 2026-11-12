@@ -81,8 +81,9 @@ platforms:
 - **Cron.** `deliver=sabha` posts to `SABHA_HOME_CHANNEL`, from the gateway or from a separate
   `hermes cron` process.
 
-Sabha keeps no backlog for a disconnected app: messages sent while the socket is down aren't
-replayed.
+Messages sent while the socket is down, or while the gateway restarts, are replayed when it
+reconnects, each once. Sabha keeps the last 5 minutes or 100 events, so a longer outage loses the
+oldest. The plugin keeps its place in `~/.hermes/plugin-data/sabha-platform/replay.json`.
 
 ## Not yet
 

@@ -59,6 +59,16 @@ def _setting(config: Any, name: str, default: str = "") -> str:
     return str(extra_or_secret(getattr(config, "extra", None) or {}, name, _ENV[name], default) or "").strip()
 
 
+def _replay_path() -> Optional[Path]:
+    """Where the event stream's position survives a restart: Hermes's per-plugin data directory."""
+    try:
+        from plugins.plugin_storage import plugin_data_dir
+        return plugin_data_dir("sabha-platform") / "replay.json"
+    except Exception as exc:
+        logger.warning("Sabha: no plugin data directory (%s); a restart may miss events", exc)
+        return None
+
+
 def check_requirements() -> bool:
     try:
         import aiohttp  # noqa: F401
@@ -125,7 +135,9 @@ class SabhaAdapter(BasePlatformAdapter):
         workspace = (me.get("workspace") or {}).get("name") or self._api_url
         logger.info("Sabha: connected as %s (%s) in %s", self._app_name, self._app_user_id, workspace)
 
-        self._stream = EventStream(self._session, self._socket_url, self._key, self._on_event)
+        from .replay import Replay
+        self._stream = EventStream(self._session, self._socket_url, self._key, self._on_event,
+                                   replay=Replay(_replay_path(), self._api_url))
         self._stream_task = asyncio.create_task(self._run_stream())
         self._mark_connected()
         return True
