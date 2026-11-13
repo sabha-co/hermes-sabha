@@ -468,7 +468,7 @@ class SabhaAdapter(BasePlatformAdapter):
             # unanswered command tells its member that Hermes didn't answer.
             reply = _command_reply.get()
             if reply and not reply["used"]:
-                await self.send(chat_id, "Confirm or cancel on the card below.")
+                await self.send(chat_id, "Confirm or cancel on the card above.")
         return result
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
