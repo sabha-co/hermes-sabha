@@ -55,6 +55,12 @@ class Replay:
             self._positions[stream_id] = {"epoch": epoch, "offset": offset}
             self._save()
 
+    def forget(self) -> None:
+        """Sabha refused the positions: a stream's history expired and it started over at offset 1,
+        so a saved offset was past its newest entry. Its new offsets count from scratch."""
+        self._positions = {}
+        self._save()
+
     def disconnected(self) -> None:
         """Records that the app was connected until now."""
         self._save()

@@ -87,6 +87,7 @@ class EventStream:
 
     async def _session_once(self) -> bool:
         subscribed = False
+        history = None
         try:
             self._ws = await self._session.ws_connect(
                 self._url, headers={"Authorization": f"Bearer {self._key}"},
@@ -129,7 +130,13 @@ class EventStream:
                 elif kind == "confirm_history":
                     logger.info("Sabha: replaying missed events")
                 elif kind == "reject_history":
-                    logger.warning("Sabha: couldn't replay missed events (history expired, or Sabha restarted)")
+                    # `since` covers only streams with no position, so ask again by it alone, once.
+                    if history and history.get("streams") and "since" in history:
+                        self._replay.forget()
+                        history = {"since": history["since"]}
+                        await self._ws.send_json({"command": "history", "identifier": IDENTIFIER, "history": history})
+                    else:
+                        logger.warning("Sabha: couldn't replay missed events (history expired, or Sabha restarted)")
                 elif kind == "reject_subscription":
                     raise KeyRefused("AppEventsChannel refused the subscription: the key isn't an app's")
                 elif kind == "disconnect":

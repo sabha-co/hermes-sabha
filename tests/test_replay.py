@@ -48,3 +48,12 @@ def test_an_unwritable_or_unreadable_file_leaves_replay_in_memory(tmp_path):
     replay.handled("app_events:2", "e1", 4)
     assert replay.history() == {"streams": {"app_events:2": {"epoch": "e1", "offset": 4}}}
     assert Replay(tmp_path / "replay.json", SERVER).history() is None
+
+
+def test_forgetting_the_positions_lets_a_restarted_stream_count_from_one(tmp_path):
+    path = tmp_path / "replay.json"
+    replay = Replay(path, SERVER)
+    replay.handled("app_events:2", "e1", 4)
+    replay.forget()
+    replay.handled("app_events:2", "e1", 1)
+    assert Replay(path, SERVER).history()["streams"] == {"app_events:2": {"epoch": "e1", "offset": 1}}
