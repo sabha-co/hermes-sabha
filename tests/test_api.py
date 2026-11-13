@@ -76,3 +76,11 @@ def test_a_status_names_its_place_and_a_clear_takes_the_thread_as_a_parameter():
     asyncio.run(api.clear_status("5", parent_message_id="80"))
     assert session.requests[0]["json"] == {"status": "Thinking…", "parent_message_id": "80"}
     assert session.requests[1]["params"] == {"parent_message_id": "80"}
+
+
+def test_a_refused_command_list_names_the_commands_another_app_holds():
+    refused = (422, {"error": "Commands refused", "code": "validation_failed",
+                     "refusals": [{"name": "new", "error": "is already another app's command"}]})
+    api = SabhaApi(Session(refused, (200, {})), "https://chat.test/api/v1", "key")
+    assert asyncio.run(api.declare_commands([{"name": "new"}, {"name": "model"}])) == ["new"]
+    assert asyncio.run(api.declare_commands([{"name": "model"}])) == []

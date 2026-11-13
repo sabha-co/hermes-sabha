@@ -14,9 +14,11 @@ logger = logging.getLogger(__name__)
 
 
 class SabhaApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, retry_after: Optional[float] = None):
+    def __init__(self, status: int, code: str, message: str, retry_after: Optional[float] = None,
+                 payload: Optional[dict[str, Any]] = None):
         super().__init__(f"Sabha API {status} {code}: {message}")
         self.status, self.code, self.retry_after = status, code, retry_after
+        self.payload = payload or {}
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,25 @@ class SabhaApi:
     async def clear_status(self, room_id: str, *, parent_message_id: Optional[str] = None) -> None:
         await self._request("DELETE", f"/rooms/{room_id}/status", params=_thread_params(parent_message_id))
 
+    async def declare_commands(self, commands: list[dict[str, str]]) -> list[str]:
+        """Replace the app's slash commands. Sabha takes the list whole or not at all; a refused
+        list changes nothing and its refused names come back, so the caller can declare the rest."""
+        try:
+            await self._request("PUT", "/profile/commands", json={"commands": commands})
+        except SabhaApiError as exc:
+            refused = [str(r.get("name")) for r in exc.payload.get("refusals") or [] if isinstance(r, dict)]
+            if exc.status != 422 or not refused:
+                raise
+            return refused
+        return []
+
+    async def respond(self, response_url: str, payload: dict[str, Any]) -> None:
+        """Answer a command or a click through its response_url, whose token is its own credential."""
+        async with self._session.post(response_url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status >= 400:
+                body = await _json_or_empty(resp)
+                raise SabhaApiError(resp.status, str(body.get("code") or resp.reason), str(body.get("error") or ""))
+
     async def download(self, url: str) -> bytes:
         """Fetch an attachment by its signed URL, which carries its own credential."""
         async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
@@ -114,7 +135,7 @@ class SabhaApi:
                 retry_after = resp.headers.get("Retry-After")
                 raise SabhaApiError(resp.status, str(payload.get("code") or resp.reason),
                                     str(payload.get("error") or ""),
-                                    float(retry_after) if retry_after and retry_after.isdigit() else None)
+                                    float(retry_after) if retry_after and retry_after.isdigit() else None, payload)
             return payload
 
 

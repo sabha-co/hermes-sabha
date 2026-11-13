@@ -19,6 +19,7 @@ the app's status: the line under a working shell where the reply will land.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +35,7 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 
+from . import commands
 from . import markup
 from . import routing
 from .retries import RetryIds
@@ -51,8 +53,12 @@ MAX_MESSAGE_LENGTH = 12000
 
 _Metadata = Optional[dict[str, Any]]
 _ENV = {"api_url": "SABHA_API_URL", "websocket_url": "SABHA_WEBSOCKET_URL", "key": "SABHA_APP_KEY"}
+_RESPONSE_URL_USES = 5
 # A parent that is gone (404) or can't hold a thread (422): post in the room instead.
 _THREAD_REFUSALS = {404, 422}
+# The response_url of the command being handled, so its first reply goes privately to whoever ran it.
+_command_reply: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
+    "sabha_command_reply", default=None)
 _MEDIA_TYPES = (("image/", MessageType.PHOTO, cache_image_from_bytes_async, ".png"),
                 ("audio/", MessageType.VOICE, cache_audio_from_bytes_async, ".ogg"),
                 ("video/", MessageType.VIDEO, cache_video_from_bytes_async, ".mp4"))
@@ -142,6 +148,7 @@ class SabhaAdapter(BasePlatformAdapter):
         self._stream = EventStream(self._session, self._socket_url, self._key, self._on_event,
                                    replay=Replay(_replay_path(), self._api_url))
         self._stream_task = asyncio.create_task(self._run_stream())
+        await self._declare_commands()
         self._mark_connected()
         return True
 
@@ -156,6 +163,19 @@ class SabhaAdapter(BasePlatformAdapter):
     async def _close_session(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()
+
+    async def _declare_commands(self) -> None:
+        """Another app may already hold a name; declare the rest, and those stay reachable as
+        ``/hermes <name>``."""
+        try:
+            from hermes_cli.commands_platforms import slack_native_slashes
+            declared = commands.declarations(slack_native_slashes())
+            refused = await self._api.declare_commands(declared)
+            if refused:
+                logger.info("Sabha: %s taken in this workspace; reachable as /hermes <name>", ", ".join(refused))
+                await self._api.declare_commands([c for c in declared if c["name"] not in refused])
+        except Exception as exc:
+            logger.warning("Sabha: couldn't declare slash commands (%s)", exc)
 
     async def _run_stream(self) -> None:
         from .cable import KeyRefused
@@ -172,6 +192,8 @@ class SabhaAdapter(BasePlatformAdapter):
     # --- Inbound ---
 
     async def _on_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") == "command":
+            return await self._on_command(event)
         if event.get("event") != "message_created" or routing.is_from_self(event, self._app_user_id):
             return
         message, user, room = event.get("message") or {}, event.get("user") or {}, event.get("room") or {}
@@ -222,6 +244,35 @@ class SabhaAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    async def _on_command(self, event: dict[str, Any]) -> None:
+        event_id = str(event.get("id", ""))
+        if not event_id or self._dedup.is_duplicate(event_id):
+            return
+        from hermes_cli.commands_platforms import slack_subcommand_map
+        text = commands.command_text(event, slack_subcommand_map())
+        chat_id, chat_type, thread_id = await self._command_place(event)
+        source = self.build_source(
+            chat_id=chat_id, chat_name=event.get("room_name") or None, chat_type=chat_type,
+            user_id=str(event.get("user_id", "")), user_name=event.get("user_name") or None, thread_id=thread_id)
+        is_command = text.startswith("/")
+        # A question asked through /hermes is a turn like any other, answered (and streamed) in the open.
+        token = _command_reply.set({"response_url": event.get("response_url"), "used": not is_command})
+        try:
+            await self.handle_message(MessageEvent(
+                text=text, message_type=MessageType.COMMAND if is_command else MessageType.TEXT,
+                source=source, raw_message=event, message_id=event_id))
+        finally:
+            _command_reply.reset(token)
+
+    async def _command_place(self, event: dict[str, Any]) -> tuple[str, str, Optional[str]]:
+        """A command event names its room but not the room's kind, so a room outside a thread is
+        looked up to tell a DM from a channel."""
+        thread = event.get("thread") or {}
+        if thread.get("parent_room_id") and thread.get("parent_message_id"):
+            return str(thread["parent_room_id"]), "channel", str(thread["parent_message_id"])
+        room_id = str(event.get("room_id", ""))
+        return room_id, "dm" if (await self.get_chat_info(room_id))["type"] == "dm" else "channel", None
+
     async def _download_attachment(self, attachment: Optional[dict]) -> tuple[list[str], list[str]]:
         if not attachment or not attachment.get("url"):
             return [], []
@@ -245,6 +296,10 @@ class SabhaAdapter(BasePlatformAdapter):
                    metadata: _Metadata = None) -> SendResult:
         if not content or not content.strip():
             return SendResult(success=True)
+        reply = _command_reply.get()
+        if reply and reply.get("response_url") and not reply["used"]:
+            reply["used"] = True
+            return await self._answer_command(reply["response_url"], content)
         thread_id = _thread_of(metadata)
         chunks = self.truncate_message(content, MAX_MESSAGE_LENGTH)
         send = (chat_id, thread_id, content)
@@ -257,6 +312,17 @@ class SabhaAdapter(BasePlatformAdapter):
                 self._retry_ids.hold(send, ids)
                 break
         return result
+
+    async def _answer_command(self, response_url: str, content: str) -> SendResult:
+        """Privately, to whoever ran the command. It's never posted for the room instead: an answer
+        meant for one member mustn't leak because the private path failed."""
+        try:
+            for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH)[:_RESPONSE_URL_USES]:
+                await self._api.respond(response_url, {"body": markup.to_html(chunk)})
+        except Exception as exc:
+            logger.warning("Sabha: couldn't answer the command (%s)", exc)
+            return SendResult(success=False, error=f"Sabha command answer failed: {exc}")
+        return SendResult(success=True)
 
     async def _post(self, chat_id: str, html: str, thread_id: Optional[str], client_message_id: str) -> SendResult:
         from .api import SabhaApiError
