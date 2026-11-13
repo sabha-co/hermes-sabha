@@ -75,7 +75,8 @@ platforms:
 - **Commands.** On connect, Hermes declares its commands, so they show in Sabha's `/` menu in
   rooms, DMs and threads the app is in. That's the first 25 of the list Hermes gives Slack, minus
   names Sabha keeps (`/help`) or another app already holds. Every command, those included, also
-  runs as `/hermes <name>`. The answer goes privately to whoever ran it. A message whose text
+  runs as `/hermes <name>`. The answer goes privately to whoever ran it. `/hermes <question>` is
+  answered in the open, like a mention. A message whose text
   starts with `/` (`@Hermes /new` in a room) still reaches Hermes as a command and is answered in
   the open.
 - **Retries.** Every post carries an id of its own. When a post times out or fails with a 5xx,

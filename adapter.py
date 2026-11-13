@@ -227,10 +227,12 @@ class SabhaAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=chat_id, chat_name=event.get("room_name") or None, chat_type=chat_type,
             user_id=str(event.get("user_id", "")), user_name=event.get("user_name") or None, thread_id=thread_id)
-        token = _command_reply.set({"response_url": event.get("response_url"), "used": False})
+        is_command = text.startswith("/")
+        # A question asked through /hermes is a turn like any other, answered (and streamed) in the open.
+        token = _command_reply.set({"response_url": event.get("response_url"), "used": not is_command})
         try:
             await self.handle_message(MessageEvent(
-                text=text, message_type=MessageType.COMMAND if text.startswith("/") else MessageType.TEXT,
+                text=text, message_type=MessageType.COMMAND if is_command else MessageType.TEXT,
                 source=source, raw_message=event, message_id=event_id))
         finally:
             _command_reply.reset(token)
