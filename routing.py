@@ -61,9 +61,17 @@ def thread_context(parent: dict[str, Any], replies: list[dict[str, Any]], *, cur
             return f"{prefix}[assistant] {text}"
         return f"{prefix}{creator.get('name') or 'someone'}: {text}"
 
-    earlier = [m for m in reversed(replies) if str(m.get("id")) != str(current_id)]
+    # The page is the thread's latest, so it can hold replies posted after the one being answered.
+    earlier = [m for m in reversed(replies) if _id(m) < _id({"id": current_id})]
     lines = [l for l in [line(parent, "[thread parent] "), *map(line, earlier)] if l]
     if not lines:
         return None
     return ("[Thread context — prior messages in this thread (not yet in conversation history):]\n"
             + "\n".join(lines) + "\n[End of thread context]\n\n")
+
+
+def _id(message: dict[str, Any]) -> int:
+    try:
+        return int(message.get("id"))
+    except (TypeError, ValueError):
+        return 0
