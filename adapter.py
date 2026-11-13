@@ -41,6 +41,9 @@ from .status import StatusLines
 
 logger = logging.getLogger(__name__)
 
+# Replies read for a thread's context: enough for the start of most threads, in one request.
+_THREAD_CONTEXT_LIMIT = 50
+
 PLATFORM = "sabha"
 
 # Sabha has no hard cap this small; it keeps a streamed reply's edits cheap and a long answer readable.
@@ -191,9 +194,33 @@ class SabhaAdapter(BasePlatformAdapter):
             chat_id=route.chat_id, chat_name=room.get("name") or None, chat_type=route.chat_type,
             user_id=str(user.get("id", "")), user_name=user.get("name") or None, thread_id=route.thread_id,
             message_id=message_id, is_bot=user.get("role") == "bot")
+        context = await self._thread_context(message) if not self._has_session(source) else None
         await self.handle_message(MessageEvent(
             text=text, message_type=kind, source=source, raw_message=event, message_id=message_id,
-            media_urls=media_urls, media_types=media_types))
+            media_urls=media_urls, media_types=media_types, channel_context=context))
+
+    # Mentioned in a thread it hasn't been in, the app would otherwise see only the mention. Loaded
+    # once, for a session's first turn, as Hermes's Slack adapter does; later turns have the history.
+    async def _thread_context(self, message: dict[str, Any]) -> Optional[str]:
+        thread = message.get("thread") or {}
+        if not thread.get("id") or not thread.get("parent_message_id"):
+            return None
+        try:
+            parent = await self._api.message(str(thread["parent_message_id"]))
+            replies = await self._api.messages(str(thread["id"]), limit=_THREAD_CONTEXT_LIMIT)
+        except Exception as exc:
+            logger.warning("Sabha: couldn't read thread %s for context (%s)", thread["id"], exc)
+            return None
+        return routing.thread_context(parent, replies, current_id=message.get("id"), app_user_id=self._app_user_id)
+
+    def _has_session(self, source: Any) -> bool:
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return False
+        try:
+            return store.peek_session_id(self._source_session_key(source)) is not None
+        except Exception:
+            return False
 
     async def _download_attachment(self, attachment: Optional[dict]) -> tuple[list[str], list[str]]:
         if not attachment or not attachment.get("url"):
