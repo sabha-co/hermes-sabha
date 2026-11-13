@@ -72,8 +72,12 @@ platforms:
   by default), answers stream in by editing the reply in place. Otherwise each reply lands whole.
 - **Files.** Attachments people send are downloaded for the agent. Files the agent sends are posted
   as attachments, with any caption as a message just before.
-- **Commands.** A message starting with `/` that Sabha doesn't claim reaches Hermes as a command
-  (`/new`, `/stop`…).
+- **Commands.** On connect, Hermes declares its commands, so they show in Sabha's `/` menu in
+  rooms, DMs and threads the app is in. That's the first 25 of the list Hermes gives Slack, minus
+  names Sabha keeps (`/help`) or another app already holds. Every command, those included, also
+  runs as `/hermes <name>`. The answer goes privately to whoever ran it. A message whose text
+  starts with `/` (`@Hermes /new` in a room) still reaches Hermes as a command and is answered in
+  the open.
 - **Retries.** Every post carries an id of its own. When a post times out or fails with a 5xx,
   Hermes retries it, and Sabha answers a post it already saved with that message instead of
   posting it twice. On a Sabha too old to take the id, the plugin posts without it, and a
@@ -89,7 +93,6 @@ oldest. The plugin keeps its place in `~/.hermes/plugin-data/sabha-platform/repl
 
 - Hermes' approval and clarify buttons as Sabha Block Kit cards (Sabha supports them; they come
   back as `block_actions` events).
-- Hermes' commands in Sabha's `/` menu, through `PUT /profile/commands` and `command` events.
 - Webhook delivery instead of the WebSocket.
 
 ## Development
