@@ -79,6 +79,12 @@ platforms:
   answered in the open, like a mention. A message whose text
   starts with `/` (`@Hermes /new` in a room) still reaches Hermes as a command and is answered in
   the open.
+- **Approvals and questions.** When Hermes needs an OK to run a command, or asks a question with
+  choices, it posts a card with buttons where it's working. Only someone on the allowlist can
+  press them; anyone else is told so privately. Once answered, the card shows who chose what and
+  loses its buttons, as it does when the wait runs out. `/approve` and `/deny` still work, and
+  typing an answer still answers a question. Cards are kept in memory, so after a restart a card
+  says it has expired, as do Hermes's own pending prompts.
 - **Retries.** Every post carries an id of its own. When a post times out or fails with a 5xx,
   Hermes retries it, and Sabha answers a post it already saved with that message instead of
   posting it twice. On a Sabha too old to take the id, the plugin posts without it, and a
@@ -92,8 +98,6 @@ oldest. The plugin keeps its place in `~/.hermes/plugin-data/sabha-platform/repl
 
 ## Not yet
 
-- Hermes' approval and clarify buttons as Sabha Block Kit cards (Sabha supports them; they come
-  back as `block_actions` events).
 - Webhook delivery instead of the WebSocket.
 
 ## Development

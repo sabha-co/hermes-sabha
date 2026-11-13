@@ -35,6 +35,7 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 
+from . import cards
 from . import commands
 from . import markup
 from . import routing
@@ -114,6 +115,7 @@ class SabhaAdapter(BasePlatformAdapter):
         self._status_lines = StatusLines()
         self._dedup = MessageDeduplicator(ttl_seconds=600)
         self._retry_ids = RetryIds()
+        self._cards = cards.Cards()
 
     # --- Lifecycle ---
 
@@ -194,6 +196,8 @@ class SabhaAdapter(BasePlatformAdapter):
     async def _on_event(self, event: dict[str, Any]) -> None:
         if event.get("event") == "command":
             return await self._on_command(event)
+        if event.get("event") == "block_actions":
+            return await self._on_click(event)
         if event.get("event") != "message_created" or routing.is_from_self(event, self._app_user_id):
             return
         message, user, room = event.get("message") or {}, event.get("user") or {}, event.get("room") or {}
@@ -345,8 +349,10 @@ class SabhaAdapter(BasePlatformAdapter):
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *,
                            finalize: bool = False) -> SendResult:
+        # Hermes edits an approval card in place when nobody answered in time; its buttons go with it.
+        drop_card = self._cards.pop(str(message_id)) is not None
         try:
-            await self._api.edit_message(message_id, markup.to_html(content[:MAX_MESSAGE_LENGTH]))
+            await self._api.edit_message(message_id, markup.to_html(content[:MAX_MESSAGE_LENGTH]), drop_card=drop_card)
         except Exception as exc:
             return SendResult(success=False, error=f"Sabha edit failed: {exc}")
         return SendResult(success=True, message_id=message_id)
@@ -426,6 +432,144 @@ class SabhaAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Sabha upload failed: {exc}", retryable=True)
         self._status_lines.posted((str(chat_id), thread_id))
         return SendResult(success=True, message_id=posted.id)
+
+    # --- Approval and clarify cards ---
+
+    _EA_REASON_BUDGET = 500
+
+    def _ea_escape(self, text: str) -> str:
+        return cards.escape(text)
+
+    def _exec_approval_cmd_budget(self, description: str, smart_denied: bool) -> int:
+        """The command preview gets what's left of the card's section once the rest of the prompt fits."""
+        fixed = (len(self._EA_HEADER) + len(self._EA_CODE_OPEN) + len(self._EA_CODE_CLOSE) + len(self._EA_REASON_LABEL)
+                 + len(cards.escape(description)) + len("...") + len(self._ea_deadline_line())
+                 + (len(self._EA_SMART_DENY_LINE) if smart_denied else 0))
+        return max(0, cards.SECTION_LIMIT - fixed)
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        result = await self._post_card(prompt.chat_id, prompt.metadata, f"Approve: {prompt.command[:100]}",
+                                       cards.approval(prompt.text, prompt.actions, prompt.session_key))
+        if result.success:
+            self._cards.add(result.message_id, cards.Card(
+                "approval", prompt.text.replace(self._ea_deadline_line(), ""), str(prompt.chat_id),
+                session_key=prompt.session_key, request_id=prompt.request_id))
+        return result
+
+    async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+                           session_key: str, metadata: _Metadata = None) -> SendResult:
+        if choices:
+            result = await self._post_card(chat_id, metadata, (question or "")[:200],
+                                           cards.clarify(question, choices, clarify_id))
+            if result.success:
+                self._cards.add(result.message_id, cards.Card(
+                    "clarify", cards.question_text(question), str(chat_id), session_key=session_key,
+                    clarify_id=clarify_id))
+                return result
+        return await super().send_clarify(chat_id=chat_id, question=question, choices=choices,
+                                          clarify_id=clarify_id, session_key=session_key, metadata=metadata)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """The gateway ends a clarify nobody clicked: it timed out, the session reset, or a typed
+        reply answered it. The card then stops offering buttons that can't answer anything."""
+        found = self._cards.pop_clarify(clarify_id)
+        if not found:
+            return
+        message_id, card = found
+        try:
+            await self._api.edit_card(message_id, notice, cards.answered(card.text, notice))
+        except Exception as exc:
+            logger.debug("Sabha: couldn't retire clarify card %s (%s)", message_id, exc)
+
+    async def _post_card(self, chat_id: str, metadata: _Metadata, text: str, blocks: list) -> SendResult:
+        from .api import SabhaApiError
+        thread_id = _thread_of(metadata)
+        try:
+            posted = await self._api.post_card(chat_id, text, blocks, parent_message_id=thread_id)
+        except SabhaApiError as exc:
+            logger.warning("Sabha: couldn't post a card in %s (%s)", chat_id, exc)
+            return _failed(exc)
+        except Exception as exc:
+            return SendResult(success=False, error=f"Sabha card post failed: {exc}", retryable=True)
+        self._status_lines.posted((str(chat_id), thread_id))
+        return SendResult(success=True, message_id=posted.id)
+
+    async def _on_click(self, event: dict[str, Any]) -> None:
+        event_id = str(event.get("id", ""))
+        if not event_id or self._dedup.is_duplicate(event_id):
+            return
+        action = (event.get("actions") or [{}])[0]
+        action_id, value = str(action.get("action_id", "")), str(action.get("value", ""))
+        message_id = str((event.get("message") or {}).get("id", ""))
+        user = event.get("user") or {}
+        response_url = str(event.get("response_url") or "")
+        card = self._cards.get(message_id)
+        if card is None:
+            await self._respond(response_url, {"text": "This prompt has expired."})
+            return
+        if not await self._may_answer(user, card):
+            await self._respond(response_url, {"text": "Only people allowed to use Hermes can answer this."})
+            return
+        name = str(user.get("name") or "someone")
+        if card.kind == "approval":
+            note = self._answer_approval(message_id, card, action_id, name)
+        else:
+            note = self._answer_clarify(message_id, card, action_id, value, name)
+        if note:
+            await self._respond(response_url, {"replace_original": True, "text": note,
+                                               "blocks": cards.answered(card.text, note)})
+
+    async def _may_answer(self, user: dict[str, Any], card: cards.Card) -> bool:
+        """Whoever can talk to Hermes in the card's room. Sabha says who clicked; the gateway's
+        allowlist says whether they count."""
+        if user.get("role") == "bot":
+            return False
+        chat_type = (await self.get_chat_info(card.chat_id))["type"]
+        return self._is_sender_authorized(str(user.get("id", "")), chat_type, card.chat_id) is True
+
+    def _answer_approval(self, message_id: str, card: cards.Card, action_id: str, name: str) -> Optional[str]:
+        choice = cards.APPROVAL_CHOICES.get(action_id)
+        if choice is None:
+            return None
+        self._cards.pop(message_id)
+        from tools.approval import resolve_gateway_approval_card
+        try:
+            resolved = resolve_gateway_approval_card(card.session_key, choice, card.request_id)
+        except Exception as exc:
+            logger.error("Sabha: couldn't resolve the approval (%s)", exc)
+            resolved = 0
+        logger.info("Sabha: %s chose %s for %s (%d resolved)", name, choice, card.session_key, resolved)
+        if not resolved:
+            return "This approval expired, so the command didn't run."
+        return f"{cards.APPROVAL_OUTCOMES[choice]} by {name}"
+
+    def _answer_clarify(self, message_id: str, card: cards.Card, action_id: str, value: str,
+                        name: str) -> Optional[str]:
+        from tools import clarify_gateway
+        clarify_id, _, token = value.partition("|")
+        if action_id == cards.CLARIFY_OTHER:
+            # The card stays known: the clarify now waits for typed text, and the gateway retires it.
+            if clarify_gateway.mark_awaiting_text(clarify_id):
+                return f"Waiting for {name} to type an answer"
+            self._cards.pop(message_id)
+            return "This question expired."
+        if not action_id.startswith(cards.CLARIFY_CHOICE) or not token.isdigit():
+            return None
+        self._cards.pop(message_id)
+        entry = clarify_gateway.get_pending(clarify_id)
+        choices = list(getattr(entry, "choices", None) or [])
+        index = int(token)
+        if index < len(choices) and clarify_gateway.resolve_gateway_clarify(clarify_id, str(choices[index])):
+            return f"{name} chose {choices[index]}"
+        return "This question expired."
+
+    async def _respond(self, response_url: str, payload: dict[str, Any]) -> None:
+        if not response_url:
+            return
+        try:
+            await self._api.respond(response_url, payload)
+        except Exception as exc:
+            logger.warning("Sabha: couldn't answer the click (%s)", exc)
 
     # --- Status line ---
 

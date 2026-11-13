@@ -68,8 +68,19 @@ class SabhaApi:
 
         return await self._create(room_id, parent_message_id, client_message_id, request)
 
-    async def edit_message(self, message_id: str, html: str) -> None:
-        await self._request("PATCH", f"/messages/{message_id}", json={"body": html})
+    async def post_card(self, room_id: str, text: str, blocks: list[dict[str, Any]], *,
+                        parent_message_id: Optional[str] = None) -> Posted:
+        """``text`` is the card's fallback, for previews and notifications."""
+        return await self._create(room_id, parent_message_id, None,
+                                  lambda extra: {"json": {"text": text, "blocks": blocks, **extra}})
+
+    async def edit_card(self, message_id: str, text: str, blocks: list[dict[str, Any]]) -> None:
+        await self._request("PATCH", f"/messages/{message_id}", json={"text": text, "blocks": blocks})
+
+    async def edit_message(self, message_id: str, html: str, *, drop_card: bool = False) -> None:
+        """An HTML edit keeps a card's blocks unless ``drop_card`` removes them."""
+        await self._request("PATCH", f"/messages/{message_id}",
+                            json={"body": html, **({"blocks": []} if drop_card else {})})
 
     async def delete_message(self, message_id: str) -> None:
         await self._request("DELETE", f"/messages/{message_id}")
