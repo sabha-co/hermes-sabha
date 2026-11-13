@@ -16,6 +16,9 @@ APPROVAL_ACTIONS = {"once": "hermes_approve_once", "session": "hermes_approve_se
 APPROVAL_CHOICES = {action_id: choice for choice, action_id in APPROVAL_ACTIONS.items()}
 APPROVAL_OUTCOMES = {"once": "Approved once", "session": "Approved for this session",
                      "always": "Approved permanently", "deny": "Denied"}
+CONFIRM_ACTIONS = {"once": "hermes_confirm_once", "always": "hermes_confirm_always", "cancel": "hermes_confirm_cancel"}
+CONFIRM_CHOICES = {action_id: choice for choice, action_id in CONFIRM_ACTIONS.items()}
+CONFIRM_OUTCOMES = {"once": "Approved once", "always": "Always approved", "cancel": "Cancelled"}
 CLARIFY_CHOICE = "hermes_clarify_choice"
 CLARIFY_OTHER = "hermes_clarify_other"
 
@@ -46,6 +49,18 @@ def approval(text: str, actions: list[tuple[str, str, str]], session_key: str) -
     return [_section(text), {"type": "actions", "elements": buttons}]
 
 
+def confirm(text: str, confirm_id: str) -> list[dict[str, Any]]:
+    """A slash command asking before it acts, like ``/new`` dropping the conversation."""
+    buttons = [_button("Approve Once", CONFIRM_ACTIONS["once"], confirm_id, "primary"),
+               _button("Always Approve", CONFIRM_ACTIONS["always"], confirm_id),
+               _button("Cancel", CONFIRM_ACTIONS["cancel"], confirm_id, "danger")]
+    return [_section(text), {"type": "actions", "elements": buttons}]
+
+
+def confirm_text(title: str, message: str) -> str:
+    return f"*{escape(title or 'Confirm')}*\n\n{escape(message or '')}"
+
+
 def clarify(question: str, choices: list[Any], clarify_id: str) -> list[dict[str, Any]]:
     buttons = [_button(str(choice).strip() or f"Option {index + 1}", f"{CLARIFY_CHOICE}_{index}",
                        f"{clarify_id}|{index}")
@@ -65,12 +80,14 @@ def answered(text: str, note: str) -> list[dict[str, Any]]:
 
 @dataclass
 class Card:
-    kind: str  # "approval" or "clarify"
+    kind: str  # "approval", "confirm" or "clarify"
     text: str
     chat_id: str
     session_key: str = ""
     request_id: Optional[str] = None
     clarify_id: str = ""
+    confirm_id: str = ""
+    thread_id: Optional[str] = None
 
 
 class Cards:

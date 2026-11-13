@@ -456,6 +456,16 @@ class SabhaAdapter(BasePlatformAdapter):
                 session_key=prompt.session_key, request_id=prompt.request_id))
         return result
 
+    async def send_slash_confirm(self, chat_id: str, title: str, message: str, session_key: str,
+                                 confirm_id: str, metadata: _Metadata = None) -> SendResult:
+        text = cards.confirm_text(title, message)
+        result = await self._post_card(chat_id, metadata, f"{title}: {message[:100]}", cards.confirm(text, confirm_id))
+        if result.success:
+            self._cards.add(result.message_id, cards.Card(
+                "confirm", text, str(chat_id), session_key=session_key, confirm_id=confirm_id,
+                thread_id=_thread_of(metadata)))
+        return result
+
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                            session_key: str, metadata: _Metadata = None) -> SendResult:
         if choices:
@@ -513,6 +523,8 @@ class SabhaAdapter(BasePlatformAdapter):
         name = str(user.get("name") or "someone")
         if card.kind == "approval":
             note = self._answer_approval(message_id, card, action_id, name)
+        elif card.kind == "confirm":
+            note = await self._answer_confirm(message_id, card, action_id, value, name)
         else:
             note = self._answer_clarify(message_id, card, action_id, value, name)
         if note:
@@ -542,6 +554,19 @@ class SabhaAdapter(BasePlatformAdapter):
         if not resolved:
             return "This approval expired, so the command didn't run."
         return f"{cards.APPROVAL_OUTCOMES[choice]} by {name}"
+
+    async def _answer_confirm(self, message_id: str, card: cards.Card, action_id: str, value: str,
+                              name: str) -> Optional[str]:
+        choice = cards.CONFIRM_CHOICES.get(action_id)
+        if choice is None or value != card.confirm_id:
+            return None
+        self._cards.pop(message_id)
+        from tools import slash_confirm
+        result = await slash_confirm.resolve(card.session_key, card.confirm_id, choice)
+        if result is None:
+            return "This confirmation expired."
+        await self.send(card.chat_id, result, metadata={"thread_id": card.thread_id} if card.thread_id else None)
+        return f"{cards.CONFIRM_OUTCOMES[choice]} by {name}"
 
     def _answer_clarify(self, message_id: str, card: cards.Card, action_id: str, value: str,
                         name: str) -> Optional[str]:
