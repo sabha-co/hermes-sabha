@@ -464,6 +464,11 @@ class SabhaAdapter(BasePlatformAdapter):
             self._cards.add(result.message_id, cards.Card(
                 "confirm", text, str(chat_id), session_key=session_key, confirm_id=confirm_id,
                 thread_id=_thread_of(metadata)))
+            # Hermes sends nothing else for a command whose confirmation got buttons, and an
+            # unanswered command tells its member that Hermes didn't answer.
+            reply = _command_reply.get()
+            if reply and not reply["used"]:
+                await self.send(chat_id, "Confirm or cancel on the card below.")
         return result
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,

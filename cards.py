@@ -58,7 +58,8 @@ def confirm(text: str, confirm_id: str) -> list[dict[str, Any]]:
 
 
 def confirm_text(title: str, message: str) -> str:
-    return f"*{escape(title or 'Confirm')}*\n\n{escape(message or '')}"
+    """Hermes's message carries its own heading, so the title shows only when there's no message."""
+    return escape(message or f"Confirm {title}")
 
 
 def clarify(question: str, choices: list[Any], clarify_id: str) -> list[dict[str, Any]]:

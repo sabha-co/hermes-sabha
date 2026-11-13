@@ -29,7 +29,7 @@ def test_a_clarify_card_is_found_by_its_clarify_id_once():
 
 
 def test_a_confirm_card_offers_once_always_and_cancel_for_its_confirm_id():
-    blocks = confirm(confirm_text("Confirm /new", "Drops <history>"), "7")
-    assert blocks[0]["text"]["text"] == "*Confirm /new*\n\nDrops &lt;history&gt;"
+    blocks = confirm(confirm_text("/new", "Drops <history>"), "7")
+    assert blocks[0]["text"]["text"] == "Drops &lt;history&gt;"
     assert [(b["action_id"], b["value"]) for b in blocks[1]["elements"]] == [
         ("hermes_confirm_once", "7"), ("hermes_confirm_always", "7"), ("hermes_confirm_cancel", "7")]
