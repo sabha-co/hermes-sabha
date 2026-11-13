@@ -1,4 +1,4 @@
-from routing import Route, inbound_route, is_from_self, message_text
+from routing import Route, inbound_route, is_from_self, message_text, thread_context
 
 
 def event(room_type="Open", members=12, thread=None, message_id=10, room_id=5):
@@ -36,3 +36,21 @@ def test_own_messages_and_text():
     assert is_from_self(event(), "1")
     assert not is_from_self(event(), "")
     assert message_text(event()) == "**hi** @Hermes"
+
+
+def test_thread_context_shows_the_parent_and_earlier_replies_oldest_first():
+    parent = {"id": 10, "creator": {"id": 1, "name": "Ann"}, "body": {"markdown": "Deploy is failing"}}
+    replies = [  # newest first, as Sabha pages them
+        {"id": 13, "creator": {"id": 1, "name": "Ann"}, "body": {"markdown": "@Hermes any idea?"}},
+        {"id": 12, "creator": {"id": 2, "name": "Hermes"}, "body": {"markdown": "Looking"}},
+        {"id": 11, "creator": {"id": 3, "name": "Bo"}, "body": {"plain": "Since 9am"}},
+    ]
+
+    context = thread_context(parent, replies, current_id=13, app_user_id="2")
+
+    assert context.splitlines()[1:4] == ["[thread parent] Ann: Deploy is failing", "Bo: Since 9am", "[assistant] Looking"]
+    assert "any idea" not in context
+
+
+def test_thread_context_is_none_when_nothing_has_text():
+    assert thread_context({"body": {}}, [], current_id=1, app_user_id="2") is None

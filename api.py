@@ -38,6 +38,14 @@ class SabhaApi:
     async def room(self, room_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/rooms/{room_id}")
 
+    async def message(self, message_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/messages/{message_id}")
+
+    async def messages(self, room_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """A room's latest messages, newest first."""
+        data = await self._request("GET", f"/rooms/{room_id}/messages", params={"limit": limit})
+        return list(data.get("results") or [])
+
     async def post_message(self, room_id: str, html: str, *, parent_message_id: Optional[str] = None,
                            client_message_id: Optional[str] = None) -> Posted:
         return await self._create(room_id, parent_message_id, client_message_id,
