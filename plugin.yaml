@@ -2,6 +2,7 @@ name: sabha-platform
 label: Sabha
 kind: platform
 version: "0.2.0"
+requires_hermes: ">=0.23.0"
 description: >
   Sabha gateway adapter for Hermes Agent. Joins a Sabha workspace as an app:
   hears mentions, DMs and threads over the app WebSocket (AppEventsChannel),

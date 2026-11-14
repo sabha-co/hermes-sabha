@@ -8,6 +8,8 @@ and tools; Sabha is where people talk to it.
 
 ## Install
 
+Needs Hermes 0.23.0 or newer.
+
 ```bash
 hermes plugins install sabha-co/hermes-sabha
 hermes plugins enable sabha-platform
