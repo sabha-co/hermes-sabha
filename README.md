@@ -13,9 +13,15 @@ Needs Hermes 0.23.0 or newer.
 ```bash
 hermes plugins install sabha-co/hermes-sabha
 hermes plugins enable sabha-platform
-hermes gateway setup      # pick Sabha
+hermes sabha setup --url https://chat.example.com/api/v1 --cable-url wss://chat.example.com/cable \
+  --key sabha_app_… --allowed-users 1
 hermes gateway restart
 ```
+
+Sabha's app page gives these lines with the values filled in: on its **API** tab, pick Hermes under
+**Set up with**. `hermes sabha setup` checks the key with Sabha before it saves anything, and
+running it again replaces the values rather than adding to them. Run it with no flags to be asked for
+each one, or use `hermes gateway setup` and pick Sabha.
 
 `hermes status` should then list Sabha under messaging platforms.
 
@@ -32,7 +38,7 @@ under "What its key can do" on the app's page.
 
 ## Configure
 
-`hermes gateway setup` writes these to `~/.hermes/.env`:
+`hermes sabha setup` (or `hermes gateway setup`) writes these to `~/.hermes/.env`:
 
 | Variable | Required | |
 |---|---|---|

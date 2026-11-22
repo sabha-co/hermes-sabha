@@ -1,6 +1,6 @@
 [project]
 name = "hermes-sabha"
-version = "0.2.0"
+version = "0.3.0"
 description = "Sabha platform plugin for Hermes Agent: join a Sabha workspace as an app."
 readme = "README.md"
 requires-python = ">=3.11"
