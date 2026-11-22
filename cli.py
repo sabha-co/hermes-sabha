@@ -24,6 +24,13 @@ class SetupError(ValueError):
     pass
 
 
+def restart_command(system_unit: bool, user_unit: bool) -> str:
+    """How to restart the gateway once the values are saved. Installed as a
+    system-wide service (and not per user, which Hermes picks first), it only
+    restarts as root."""
+    return "sudo hermes gateway restart --system" if system_unit and not user_unit else "hermes gateway restart"
+
+
 def workspace_url(url: str) -> str:
     """The workspace's URL from either it or its API base URL, as the app's
     page shows it. Empty when it isn't an http(s) URL."""
@@ -129,8 +136,16 @@ def _setup(args: argparse.Namespace) -> int:
 
     save_env_values(**values)
     print(f"✓ Saved {', '.join(values)} to Hermes's .env")
-    print("Then restart the gateway: hermes gateway restart")
+    print(f"Then restart the gateway: {_restart_command()}")
     return 0
+
+
+def _restart_command() -> str:
+    if not sys.platform.startswith("linux"):
+        return restart_command(False, False)
+    from hermes_cli.gateway import get_systemd_unit_path
+
+    return restart_command(get_systemd_unit_path(system=True).exists(), get_systemd_unit_path(system=False).exists())
 
 
 def _me(api_url: str, key: str) -> dict:

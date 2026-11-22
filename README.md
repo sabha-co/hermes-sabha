@@ -20,8 +20,9 @@ hermes gateway restart
 
 Sabha's app page gives these lines with the values filled in: on its **API** tab, pick Hermes under
 **Set up with**. `hermes sabha setup` checks the key with Sabha before it saves anything, and
-running it again replaces the values rather than adding to them. Run it with no flags to be asked for
-each one, or use `hermes gateway setup` and pick Sabha.
+running it again replaces the values rather than adding to them. It ends by saying how to restart
+the gateway here: `sudo hermes gateway restart --system` when Hermes runs as a system service. Run
+it with no flags to be asked for each one, or use `hermes gateway setup` and pick Sabha.
 
 `hermes status` should then list Sabha under messaging platforms.
 

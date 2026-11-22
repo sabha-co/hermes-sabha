@@ -1,6 +1,6 @@
 import re
 
-from cli import SetupError, settings
+from cli import SetupError, restart_command, settings
 import pytest
 
 KEY = "sabha_app_" + "0123456789abcdef" * 2
@@ -41,3 +41,13 @@ def test_what_won_t_work_is_refused_before_anything_is_saved(url, key, cable, al
 
 def test_spaces_in_the_allowlist_are_dropped():
     assert settings("https://chat.example.test", KEY, allowed_users="1, 42")["SABHA_ALLOWED_USERS"] == "1,42"
+
+
+@pytest.mark.parametrize("system_unit, user_unit, command", [
+    (True, False, "sudo hermes gateway restart --system"),
+    (True, True, "hermes gateway restart"),
+    (False, True, "hermes gateway restart"),
+    (False, False, "hermes gateway restart"),
+])
+def test_a_gateway_run_as_a_system_service_is_restarted_as_root(system_unit, user_unit, command):
+    assert restart_command(system_unit, user_unit) == command
