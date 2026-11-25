@@ -35,10 +35,10 @@ optional_env:
     prompt: "Allow all users? (true/false)"
     password: false
   - name: SABHA_HOME_CHANNEL
-    description: "Room id for cron and notification delivery"
-    prompt: "Home room id"
+    description: "Channel id for cron and notification delivery"
+    prompt: "Home channel id"
     password: false
   - name: SABHA_REPLY_MODE
-    description: "Reply to a room mention in a thread ('thread', the default) or in the room ('off')"
+    description: "Reply to a channel mention in a thread ('thread', the default) or in the channel ('off')"
     prompt: "Reply mode (thread|off)"
     password: false

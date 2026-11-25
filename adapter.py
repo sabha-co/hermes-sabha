@@ -2,15 +2,15 @@
 
 Hermes joins a Sabha workspace as an app. Events come in over the app WebSocket
 (``AppEventsChannel``), and replies go out through the apps API (``/api/v1``). Sabha delivers a
-room message only when it mentions the app; a DM or a thread the app is in, every message.
+channel message only when it mentions the app; a DM or a thread the app is in, every message.
 
 Environment (or ``platforms.sabha.extra`` in config.yaml):
     SABHA_API_URL        API base URL from the app's page, e.g. https://chat.example.com/api/v1
     SABHA_WEBSOCKET_URL  WebSocket URL from the app's page, e.g. wss://chat.example.com/cable
     SABHA_APP_KEY        The app's bearer key (sabha_app_…)
     SABHA_ALLOWED_USERS  Comma-separated Sabha user ids allowed to talk to the agent
-    SABHA_HOME_CHANNEL   Room id for cron and notification delivery
-    SABHA_REPLY_MODE     "thread" (default) answers a room mention in a thread; "off" in the room
+    SABHA_HOME_CHANNEL   Channel id for cron and notification delivery
+    SABHA_REPLY_MODE     "thread" (default) answers a channel mention in a thread; "off" in the channel
 
 While the agent works, Hermes's typing indicator and its live phrases ("Searching the web…") show as
 the app's status: the line under a working shell where the reply will land.
@@ -55,7 +55,7 @@ MAX_MESSAGE_LENGTH = 12000
 _Metadata = Optional[dict[str, Any]]
 _ENV = {"api_url": "SABHA_API_URL", "websocket_url": "SABHA_WEBSOCKET_URL", "key": "SABHA_APP_KEY"}
 _RESPONSE_URL_USES = 5
-# A parent that is gone (404) or can't hold a thread (422): post in the room instead.
+# A parent that is gone (404) or can't hold a thread (422): post in the channel instead.
 _THREAD_REFUSALS = {404, 422}
 # The response_url of the command being handled, so its first reply goes privately to whoever ran it.
 _command_reply: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
@@ -200,7 +200,7 @@ class SabhaAdapter(BasePlatformAdapter):
             return await self._on_click(event)
         if event.get("event") != "message_created" or routing.is_from_self(event, self._app_user_id):
             return
-        message, user, room = event.get("message") or {}, event.get("user") or {}, event.get("room") or {}
+        message, user, channel = event.get("message") or {}, event.get("user") or {}, event.get("channel") or {}
         message_id = str(message.get("id", ""))
         if not message_id or self._dedup.is_duplicate(message_id):
             return
@@ -217,7 +217,7 @@ class SabhaAdapter(BasePlatformAdapter):
             kind = MessageType.TEXT
 
         source = self.build_source(
-            chat_id=route.chat_id, chat_name=room.get("name") or None, chat_type=route.chat_type,
+            chat_id=route.chat_id, chat_name=channel.get("name") or None, chat_type=route.chat_type,
             user_id=str(user.get("id", "")), user_name=user.get("name") or None, thread_id=route.thread_id,
             message_id=message_id, is_bot=user.get("role") == "bot")
         context = await self._thread_context(message) if not self._has_session(source) else None
@@ -256,7 +256,7 @@ class SabhaAdapter(BasePlatformAdapter):
         text = commands.command_text(event, slack_subcommand_map())
         chat_id, chat_type, thread_id = await self._command_place(event)
         source = self.build_source(
-            chat_id=chat_id, chat_name=event.get("room_name") or None, chat_type=chat_type,
+            chat_id=chat_id, chat_name=event.get("channel_name") or None, chat_type=chat_type,
             user_id=str(event.get("user_id", "")), user_name=event.get("user_name") or None, thread_id=thread_id)
         is_command = text.startswith("/")
         # A question asked through /hermes is a turn like any other, answered (and streamed) in the open.
@@ -269,13 +269,13 @@ class SabhaAdapter(BasePlatformAdapter):
             _command_reply.reset(token)
 
     async def _command_place(self, event: dict[str, Any]) -> tuple[str, str, Optional[str]]:
-        """A command event names its room but not the room's kind, so a room outside a thread is
+        """A command event names its channel but not the channel's kind, so a channel outside a thread is
         looked up to tell a DM from a channel."""
         thread = event.get("thread") or {}
-        if thread.get("parent_room_id") and thread.get("parent_message_id"):
-            return str(thread["parent_room_id"]), "channel", str(thread["parent_message_id"])
-        room_id = str(event.get("room_id", ""))
-        return room_id, "dm" if (await self.get_chat_info(room_id))["type"] == "dm" else "channel", None
+        if thread.get("parent_channel_id") and thread.get("parent_message_id"):
+            return str(thread["parent_channel_id"]), "channel", str(thread["parent_message_id"])
+        channel_id = str(event.get("channel_id", ""))
+        return channel_id, "dm" if (await self.get_chat_info(channel_id))["type"] == "dm" else "channel", None
 
     async def _download_attachment(self, attachment: Optional[dict]) -> tuple[list[str], list[str]]:
         if not attachment or not attachment.get("url"):
@@ -318,7 +318,7 @@ class SabhaAdapter(BasePlatformAdapter):
         return result
 
     async def _answer_command(self, response_url: str, content: str) -> SendResult:
-        """Privately, to whoever ran the command. It's never posted for the room instead: an answer
+        """Privately, to whoever ran the command. It's never posted for the channel instead: an answer
         meant for one member mustn't leak because the private path failed."""
         try:
             for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH)[:_RESPONSE_URL_USES]:
@@ -336,7 +336,7 @@ class SabhaAdapter(BasePlatformAdapter):
         except SabhaApiError as exc:
             if not (thread_id and exc.status in _THREAD_REFUSALS):
                 return _failed(exc)
-            logger.warning("Sabha: couldn't reply in the thread of %s (%s); posting in the room", thread_id, exc)
+            logger.warning("Sabha: couldn't reply in the thread of %s (%s); posting in the channel", thread_id, exc)
             try:
                 posted = await self._api.post_message(chat_id, html, client_message_id=client_message_id)
             except SabhaApiError as retry_exc:
@@ -367,11 +367,11 @@ class SabhaAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         try:
-            room = await self._api.room(chat_id)
+            channel = await self._api.channel(chat_id)
         except Exception:
             return {"name": chat_id, "type": "channel"}
-        kind = "dm" if room.get("type") == "Direct" else "channel"
-        return {"name": room.get("name") or chat_id, "type": kind}
+        kind = "dm" if channel.get("type") == "Direct" else "channel"
+        return {"name": channel.get("name") or chat_id, "type": kind}
 
     # --- Files ---
 
@@ -537,7 +537,7 @@ class SabhaAdapter(BasePlatformAdapter):
                                                "blocks": cards.answered(card.text, note)})
 
     async def _may_answer(self, user: dict[str, Any], card: cards.Card) -> bool:
-        """Whoever can talk to Hermes in the card's room. Sabha says who clicked; the gateway's
+        """Whoever can talk to Hermes in the card's channel. Sabha says who clicked; the gateway's
         allowlist says whether they count."""
         if user.get("role") == "bot":
             return False
@@ -616,11 +616,11 @@ class SabhaAdapter(BasePlatformAdapter):
         self._status_lines.sent(place, line)
 
     async def stop_typing(self, chat_id: str, metadata: _Metadata = None) -> None:
-        for room_id, thread_id in self._status_lines.finish(str(chat_id), _thread_of(metadata)):
+        for channel_id, thread_id in self._status_lines.finish(str(chat_id), _thread_of(metadata)):
             try:
-                await self._api.clear_status(room_id, parent_message_id=thread_id)
+                await self._api.clear_status(channel_id, parent_message_id=thread_id)
             except Exception as exc:
-                logger.debug("Sabha: couldn't clear the status in %s (%s)", room_id, exc)
+                logger.debug("Sabha: couldn't clear the status in %s (%s)", channel_id, exc)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         if self._sender_refused(event):
@@ -702,7 +702,7 @@ def interactive_setup() -> None:
         return
     print_info("  In Sabha, an admin creates the app: Settings → Apps → New.")
     print_info("  Its page shows the API base URL, the WebSocket URL and the key (once).")
-    print_info("  Add the app to the rooms it should work in; DMs work without that.")
+    print_info("  Add the app to the channels it should work in; DMs work without that.")
     print()
     api_url = prompt("API base URL (e.g. https://chat.example.com/api/v1)").strip().rstrip("/")
     socket_url = prompt("WebSocket URL (e.g. wss://chat.example.com/cable)").strip()
@@ -720,7 +720,7 @@ def interactive_setup() -> None:
         print_success("  Allowlist saved")
     else:
         print_info("  No allowlist: unknown people get a pairing code to approve with `hermes pairing approve sabha`.")
-    home = prompt("Home room id for cron results (optional; the number in /rooms/12)").strip()
+    home = prompt("Home channel id for cron results (optional; the number in /channels/12)").strip()
     if home:
         save_env_values(SABHA_HOME_CHANNEL=home)
 
@@ -729,7 +729,7 @@ _PLATFORM_HINT = (
     "You are in Sabha, a team chat app, talking with your user. Write standard Markdown: bold, italics, "
     "headings, lists, links, blockquotes and code blocks all render. Tables don't, so use lists instead. "
     "To mention someone, write @{user_id} with their numeric Sabha id; it notifies them only if they are "
-    "in this room. To send a file, include MEDIA:/absolute/path/to/file in your response."
+    "in this channel. To send a file, include MEDIA:/absolute/path/to/file in your response."
 )
 
 

@@ -5,7 +5,7 @@ Markdown is rendered here, with raw HTML in it escaped rather than passed throug
 the body again on its side and keeps no tables, so tables stay as their source text.
 
 ``@{user_id}`` survives rendering untouched; Sabha turns it into a real mention when the user is a
-member of the room.
+member of the channel.
 """
 
 from __future__ import annotations

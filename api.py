@@ -24,7 +24,7 @@ class SabhaApiError(Exception):
 @dataclass(frozen=True)
 class Posted:
     id: str
-    room_id: str
+    channel_id: str
 
 
 class SabhaApi:
@@ -37,23 +37,23 @@ class SabhaApi:
     async def me(self) -> dict[str, Any]:
         return await self._request("GET", "/me")
 
-    async def room(self, room_id: str) -> dict[str, Any]:
-        return await self._request("GET", f"/rooms/{room_id}")
+    async def channel(self, channel_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/channels/{channel_id}")
 
     async def message(self, message_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/messages/{message_id}")
 
-    async def messages(self, room_id: str, *, limit: int) -> list[dict[str, Any]]:
-        """A room's latest messages, newest first."""
-        data = await self._request("GET", f"/rooms/{room_id}/messages", params={"limit": limit})
+    async def messages(self, channel_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """A channel's latest messages, newest first."""
+        data = await self._request("GET", f"/channels/{channel_id}/messages", params={"limit": limit})
         return list(data.get("results") or [])
 
-    async def post_message(self, room_id: str, html: str, *, parent_message_id: Optional[str] = None,
+    async def post_message(self, channel_id: str, html: str, *, parent_message_id: Optional[str] = None,
                            client_message_id: Optional[str] = None) -> Posted:
-        return await self._create(room_id, parent_message_id, client_message_id,
+        return await self._create(channel_id, parent_message_id, client_message_id,
                                   lambda extra: {"json": {"body": html, **extra}})
 
-    async def post_file(self, room_id: str, path: str, *, filename: Optional[str] = None,
+    async def post_file(self, channel_id: str, path: str, *, filename: Optional[str] = None,
                         parent_message_id: Optional[str] = None, client_message_id: Optional[str] = None) -> Posted:
         name = filename or Path(path).name
         content = Path(path).read_bytes()
@@ -66,12 +66,12 @@ class SabhaApi:
                 form.add_field(field, value)
             return {"data": form, "timeout": 120}
 
-        return await self._create(room_id, parent_message_id, client_message_id, request)
+        return await self._create(channel_id, parent_message_id, client_message_id, request)
 
-    async def post_card(self, room_id: str, text: str, blocks: list[dict[str, Any]], *,
+    async def post_card(self, channel_id: str, text: str, blocks: list[dict[str, Any]], *,
                         parent_message_id: Optional[str] = None) -> Posted:
         """``text`` is the card's fallback, for previews and notifications."""
-        return await self._create(room_id, parent_message_id, None,
+        return await self._create(channel_id, parent_message_id, None,
                                   lambda extra: {"json": {"text": text, "blocks": blocks, **extra}})
 
     async def edit_card(self, message_id: str, text: str, blocks: list[dict[str, Any]]) -> None:
@@ -85,13 +85,13 @@ class SabhaApi:
     async def delete_message(self, message_id: str) -> None:
         await self._request("DELETE", f"/messages/{message_id}")
 
-    async def set_status(self, room_id: str, status: str, *, parent_message_id: Optional[str] = None) -> None:
+    async def set_status(self, channel_id: str, status: str, *, parent_message_id: Optional[str] = None) -> None:
         """The line under the app's working shell where its reply will land; posting there clears it."""
-        await self._request("PUT", f"/rooms/{room_id}/status",
+        await self._request("PUT", f"/channels/{channel_id}/status",
                             json={"status": status, **({"parent_message_id": parent_message_id} if parent_message_id else {})})
 
-    async def clear_status(self, room_id: str, *, parent_message_id: Optional[str] = None) -> None:
-        await self._request("DELETE", f"/rooms/{room_id}/status", params=_thread_params(parent_message_id))
+    async def clear_status(self, channel_id: str, *, parent_message_id: Optional[str] = None) -> None:
+        await self._request("DELETE", f"/channels/{channel_id}/status", params=_thread_params(parent_message_id))
 
     async def declare_commands(self, commands: list[dict[str, str]]) -> list[str]:
         """Replace the app's slash commands. Sabha takes the list whole or not at all; a refused
@@ -118,12 +118,12 @@ class SabhaApi:
             resp.raise_for_status()
             return await resp.read()
 
-    async def _create(self, room_id: str, parent_message_id: Optional[str], client_message_id: Optional[str],
+    async def _create(self, channel_id: str, parent_message_id: Optional[str], client_message_id: Optional[str],
                       request: Callable[[dict[str, str]], dict[str, Any]]) -> Posted:
         """Post a message. With a client_message_id, a retry after a lost response gets back the post
         Sabha already saved instead of a second one. A server older than that refuses the key; the
         post then goes without it, and so does every later one."""
-        path, params = f"/rooms/{room_id}/messages", _thread_params(parent_message_id)
+        path, params = f"/channels/{channel_id}/messages", _thread_params(parent_message_id)
         extra = {"client_message_id": client_message_id} if client_message_id and self._takes_client_message_id else {}
         try:
             data = await self._request("POST", path, params=params, **request(extra))
@@ -133,7 +133,7 @@ class SabhaApi:
             logger.info("Sabha: this server doesn't take client_message_id, so retried posts may land twice")
             self._takes_client_message_id = False
             data = await self._request("POST", path, params=params, **request({}))
-        return Posted(str(data["id"]), str(data["room_id"]))
+        return Posted(str(data["id"]), str(data["channel_id"]))
 
     async def _request(self, method: str, path: str, *, json: Any = None, data: Any = None,
                        params: Optional[dict] = None, timeout: float = 30) -> dict[str, Any]:

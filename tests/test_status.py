@@ -14,7 +14,7 @@ def lines():
     return StatusLines(clock), clock
 
 
-ROOM = ("2", None)
+CHANNEL = ("2", None)
 THREAD = ("2", "80")
 
 
@@ -47,13 +47,13 @@ def test_after_a_post_there_no_refresh_puts_the_status_back_until_the_turn_ends(
     assert status.due(THREAD, None) == DEFAULT
 
 
-def test_the_end_of_a_turn_clears_only_the_statuses_still_showing_in_that_room():
+def test_the_end_of_a_turn_clears_only_the_statuses_still_showing_in_that_channel():
     status, _ = lines()
     status.sent(THREAD, DEFAULT)
-    status.sent(ROOM, DEFAULT)
+    status.sent(CHANNEL, DEFAULT)
     status.sent(("9", None), DEFAULT)
     assert status.finish("2", "80") == [THREAD]
-    assert sorted(status.finish("2"), key=str) == [ROOM]
+    assert sorted(status.finish("2"), key=str) == [CHANNEL]
     assert status.finish("2") == []
 
 

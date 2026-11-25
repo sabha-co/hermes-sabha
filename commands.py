@@ -1,6 +1,6 @@
 """Hermes's gateway commands as Sabha slash commands.
 
-Sabha shows an app's declared commands when a member types ``/`` in a room the app is in, and
+Sabha shows an app's declared commands when a member types ``/`` in a channel the app is in, and
 sends the app a ``command`` event instead of posting the text. Hermes declares the same list it
 gives Slack, ``/hermes`` first so every command stays reachable as ``/hermes <name>`` when another
 app already holds its name.

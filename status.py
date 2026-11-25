@@ -1,6 +1,6 @@
 """The line under Sabha's working shell while the agent works on a reply.
 
-Sabha shows an app's status where its reply will land (a room, or the thread under a message) and
+Sabha shows an app's status where its reply will land (a channel, or the thread under a message) and
 clears it when the app posts there, or after two minutes without an update. Hermes refreshes its
 typing indicator every couple of seconds; this keeps that from becoming a request each time.
 """
@@ -16,7 +16,7 @@ MAX_CHARS = 120
 # inside that.
 REFRESH_SECONDS = 60.0
 
-Place = tuple[str, Optional[str]]  # room id, and the message whose thread the reply goes in
+Place = tuple[str, Optional[str]]  # channel id, and the message whose thread the reply goes in
 
 
 class StatusLines:
@@ -46,7 +46,7 @@ class StatusLines:
         self._sent.pop(place, None)
 
     def quiet(self, chat_id: str) -> None:
-        """A sender the gateway is about to turn away gets no status in that room."""
+        """A sender the gateway is about to turn away gets no status in that channel."""
         self._quiet.add(chat_id)
 
     def finish(self, chat_id: str, thread_id: Optional[str] = None) -> list[Place]:

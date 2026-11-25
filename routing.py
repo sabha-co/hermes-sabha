@@ -1,9 +1,9 @@
 """Where an inbound Sabha message lives in Hermes' terms, and where its reply goes.
 
-A Sabha thread is a room of its own, rooted at a message in a parent room. Hermes keys sessions by
-chat and thread, as on Slack, so a message in a thread is addressed as ``(parent room, parent
-message)``. A reply then always posts to the parent room with ``parent_message_id``, which opens
-the thread if it isn't there yet and reuses it if it is. Nothing has to remember thread rooms.
+A Sabha thread is a channel of its own, rooted at a message in a parent channel. Hermes keys sessions by
+chat and thread, as on Slack, so a message in a thread is addressed as ``(parent channel, parent
+message)``. A reply then always posts to the parent channel with ``parent_message_id``, which opens
+the thread if it isn't there yet and reuses it if it is. Nothing has to remember thread channels.
 """
 
 from __future__ import annotations
@@ -20,19 +20,19 @@ class Route:
 
 
 def inbound_route(event: dict[str, Any], *, reply_in_thread: bool) -> Route:
-    room = event.get("room") or {}
+    channel = event.get("channel") or {}
     message = event.get("message") or {}
     thread = message.get("thread") or {}
 
-    if thread.get("parent_message_id") and thread.get("parent_room_id"):
-        return Route(str(thread["parent_room_id"]), "channel", str(thread["parent_message_id"]))
+    if thread.get("parent_message_id") and thread.get("parent_channel_id"):
+        return Route(str(thread["parent_channel_id"]), "channel", str(thread["parent_message_id"]))
 
-    room_id = str(room.get("id", ""))
-    if room.get("type") == "Direct":
-        return Route(room_id, "dm" if int(room.get("members") or 2) <= 2 else "group", None)
-    if room.get("type") in ("Open", "Closed") and reply_in_thread:
-        return Route(room_id, "channel", str(message.get("id")))
-    return Route(room_id, "channel", None)
+    channel_id = str(channel.get("id", ""))
+    if channel.get("type") == "Direct":
+        return Route(channel_id, "dm" if int(channel.get("members") or 2) <= 2 else "group", None)
+    if channel.get("type") in ("Open", "Closed") and reply_in_thread:
+        return Route(channel_id, "channel", str(message.get("id")))
+    return Route(channel_id, "channel", None)
 
 
 def is_from_self(event: dict[str, Any], app_user_id: Optional[str]) -> bool:

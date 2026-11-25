@@ -30,7 +30,7 @@ class Session:
         return Response(*self.responses.pop(0))
 
 
-POSTED = (201, {"id": 7, "room_id": 5})
+POSTED = (201, {"id": 7, "channel_id": 5})
 REFUSED = (422, {"error": "client_message_id is not permitted", "code": "validation_failed"})
 
 
